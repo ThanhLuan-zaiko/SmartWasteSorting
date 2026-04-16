@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from localagent.config import AgentPaths, RuntimeConfig, TrainingConfig
+from localagent.config import AgentPaths, DatasetPipelineConfig, RuntimeConfig, TrainingConfig
 
 
 def test_agent_paths_default_to_localagent_root() -> None:
@@ -40,3 +40,15 @@ def test_runtime_and_training_defaults_are_stable() -> None:
     assert runtime.base_url == "http://127.0.0.1:8080"
     assert training.batch_size == 16
     assert training.image_size == 224
+    assert training.manifest_path.name == "dataset_manifest.parquet"
+    assert training.labels_output_path.name == "labels.json"
+
+
+def test_dataset_pipeline_defaults_are_stable() -> None:
+    config = DatasetPipelineConfig()
+
+    assert config.raw_dataset_dir.name == "dataset"
+    assert config.manifest_path.name == "dataset_manifest.parquet"
+    assert config.report_dir.name == "reports"
+    assert config.random_seed == 42
+    assert config.label_summary_path.name == "label_summary.csv"

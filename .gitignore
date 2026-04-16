@@ -1,3 +1,9 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
 # Workspace
 .DS_Store
 Thumbs.db
@@ -64,3 +70,14 @@ logs/**/*.log
 *.ckpt
 *.bin
 *.safetensors
+*.pdb
+
+# Local datasets
+localagent/dataset/
+localagent/datasets/raw/
+
+# Generated dataset artifacts
+localagent/artifacts/manifests/*
+!localagent/artifacts/manifests/.gitkeep
+localagent/artifacts/reports/*
+!localagent/artifacts/reports/.gitkeep

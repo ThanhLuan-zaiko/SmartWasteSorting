@@ -1,3 +1,3 @@
-from .settings import AgentPaths, RuntimeConfig, TrainingConfig
+from .settings import AgentPaths, DatasetPipelineConfig, RuntimeConfig, TrainingConfig
 
-__all__ = ["AgentPaths", "RuntimeConfig", "TrainingConfig"]
+__all__ = ["AgentPaths", "DatasetPipelineConfig", "RuntimeConfig", "TrainingConfig"]

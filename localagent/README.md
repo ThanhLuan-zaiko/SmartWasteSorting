@@ -1,58 +1,50 @@
 # Local Smart Waste Agent
 
-Scaffold `localagent` nay tap trung vao agent phan loai rac bang hinh anh theo huong lai Python + Rust:
+`localagent` là phần lõi của dự án Smart Waste Sorting.
 
-- Python (`uv`) quan ly du lieu, vision transforms, huan luyen, orchestration va client giao tiep.
-- Rust (`cargo`) cung cap loi hieu nang, ONNX runtime, Python extension (`pyo3`/`maturin`) va HTTP server cuc bo.
+Hiện tại module này hỗ trợ:
 
-## Cau truc
+- quét dataset ảnh thô trong `dataset/`
+- tạo manifest Polars
+- suy nhãn từ tên file
+- phát hiện ảnh lỗi, ảnh quá nhỏ, ảnh trùng
+- tạo split `train/val/test`
+- xuất báo cáo dữ liệu
+- huấn luyện baseline trực tiếp từ manifest
+
+## Cấu trúc quan trọng
 
 ```text
 localagent/
-├── Cargo.toml
-├── pyproject.toml
-├── configs/
+├── dataset/
 ├── datasets/
-├── models/
 ├── artifacts/
-├── logs/
+│   ├── manifests/
+│   ├── reports/
+│   └── checkpoints/
+├── models/
 ├── python/localagent/
-│   ├── api/
-│   ├── bridge/
-│   ├── config/
-│   ├── data/
-│   ├── domain/
-│   ├── inference/
-│   ├── services/
-│   ├── training/
-│   ├── utils/
-│   └── vision/
 ├── src/
-│   ├── bin/
-│   ├── config.rs
-│   ├── domain.rs
-│   ├── error.rs
-│   ├── inference.rs
-│   ├── lib.rs
-│   ├── python_api.rs
-│   └── telemetry.rs
 └── tests/
 ```
 
-## Vai tro hai ngon ngu
-
-- Python la lop dieu phoi chinh cho dataset indexing, trainer, vision preprocessing va phat lenh huan luyen/suy luan.
-- Rust la backend cuc bo cho inference, kha nang phuc vu API noi bo va sau nay co the them thread pool, SIMD, ONNX runtime.
-- `maturin` + `pyo3` giu vai tro cau noi de Python goi truc tiep Rust khi can latency thap.
-
-## Lenh khoi tao tiep theo
+## Lệnh thường dùng
 
 ```powershell
 cd localagent
-uv sync
-uv run pytest
-uv run maturin develop
-cargo run --bin localagent-server
+uv sync --dev
+uv run python -m localagent.data.pipeline run-all
+uv run python -m localagent.training.train summary
+uv run python -m localagent.training.train fit
 ```
 
-Thu muc `interface` hien tai khong duoc rang buoc vao scaffold nay.
+## Đầu ra chính
+
+- `artifacts/manifests/dataset_manifest.parquet`
+- `artifacts/manifests/dataset_manifest.csv`
+- `artifacts/reports/summary.json`
+- `artifacts/reports/label_summary.csv`
+- `models/labels.json`
+- `artifacts/checkpoints/*.pt`
+
+README đầy đủ của repository nằm ở thư mục root.

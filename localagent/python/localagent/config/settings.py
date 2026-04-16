@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,3 +54,77 @@ class TrainingConfig:
     epochs: int = 10
     num_workers: int = 4
     learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    manifest_path: Path = field(
+        default_factory=lambda: _project_root()
+        / "artifacts"
+        / "manifests"
+        / "dataset_manifest.parquet"
+    )
+    labels_output_path: Path = field(
+        default_factory=lambda: _project_root() / "models" / "labels.json"
+    )
+    checkpoint_dir: Path = field(
+        default_factory=lambda: _project_root() / "artifacts" / "checkpoints"
+    )
+    device: str = "cpu"
+
+
+@dataclass(slots=True)
+class DatasetPipelineConfig:
+    raw_dataset_dir: Path = field(default_factory=lambda: _project_root() / "dataset")
+    manifest_dir: Path = field(default_factory=lambda: _project_root() / "artifacts" / "manifests")
+    report_dir: Path = field(default_factory=lambda: _project_root() / "artifacts" / "reports")
+    manifest_name: str = "dataset_manifest.parquet"
+    manifest_csv_name: str = "dataset_manifest.csv"
+    min_width: int = 32
+    min_height: int = 32
+    train_ratio: float = 0.8
+    val_ratio: float = 0.1
+    test_ratio: float = 0.1
+    random_seed: int = 42
+    allowed_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+    hash_algorithm: str = "sha256"
+    infer_labels_from_filename: bool = True
+    unknown_label: str = "unknown"
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.manifest_dir / self.manifest_name
+
+    @property
+    def manifest_csv_path(self) -> Path:
+        return self.manifest_dir / self.manifest_csv_name
+
+    @property
+    def summary_path(self) -> Path:
+        return self.report_dir / "summary.json"
+
+    @property
+    def split_summary_path(self) -> Path:
+        return self.report_dir / "split_summary.csv"
+
+    @property
+    def quality_summary_path(self) -> Path:
+        return self.report_dir / "quality_summary.csv"
+
+    @property
+    def extension_summary_path(self) -> Path:
+        return self.report_dir / "extension_summary.csv"
+
+    @property
+    def label_summary_path(self) -> Path:
+        return self.report_dir / "label_summary.csv"
+
+    def ensure_layout(self) -> DatasetPipelineConfig:
+        self.manifest_dir.mkdir(parents=True, exist_ok=True)
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def validate(self) -> DatasetPipelineConfig:
+        total = self.train_ratio + self.val_ratio + self.test_ratio
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.0")
+        if self.min_width <= 0 or self.min_height <= 0:
+            raise ValueError("min_width and min_height must be greater than zero")
+        return self
