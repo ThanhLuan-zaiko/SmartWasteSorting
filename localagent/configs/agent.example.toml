@@ -1,0 +1,12 @@
+[python]
+dataset_root = "datasets"
+artifacts_root = "artifacts"
+experiment_name = "baseline-waste-sorter"
+
+[runtime]
+model_path = "models/waste_classifier.onnx"
+labels_path = "models/labels.json"
+device = "cpu"
+score_threshold = 0.45
+server_host = "127.0.0.1"
+server_port = 8080

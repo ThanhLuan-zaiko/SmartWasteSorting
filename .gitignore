@@ -1,0 +1,66 @@
+# Workspace
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.pem
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# JavaScript / Next.js
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.next/
+out/
+coverage/
+.turbo/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python / uv
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.py[cod]
+*.pyd
+*.pyo
+
+# Rust / Cargo
+target/
+
+# Local runtime logs
+*.log
+logs/**/*.log
+
+# ML / model artifacts
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors

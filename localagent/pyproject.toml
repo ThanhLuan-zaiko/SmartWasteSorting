@@ -1,0 +1,55 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "smart-waste-localagent"
+version = "0.1.0"
+description = "Hybrid Python and Rust local agent for smart waste image classification."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "polars>=1.8",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "onnx>=1.16",
+    "onnxruntime>=1.19",
+    "maturin>=1.7,<2.0",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.uv]
+package = true
+
+[tool.maturin]
+bindings = "pyo3"
+python-source = "python"
+module-name = "localagent._rust"
+manifest-path = "Cargo.toml"
+
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+namespace_packages = true
+mypy_path = ["python"]
