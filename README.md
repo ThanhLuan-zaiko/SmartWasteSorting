@@ -2,12 +2,12 @@
 
 ## Giới thiệu
 
-Đây là repository cho hệ thống phân loại rác thông minh. Ở trạng thái hiện tại, phần chạy chính là `localagent/`, còn `interface/` vẫn là giao diện mẫu để phát triển UI sau này.
+Đây là repository cho hệ thống phân loại rác thông minh. Ở trạng thái hiện tại, phần chạy chính vẫn là `localagent/`, nhưng `interface/` đã là GUI điều khiển pipeline và dashboard thay cho workflow CLI thuần.
 
 Repository được tổ chức theo hướng:
 
 - `localagent/`: lõi xử lý cục bộ bằng Python + Rust cho pipeline dữ liệu, huấn luyện, suy luận và backend nội bộ
-- `interface/`: giao diện Next.js tham khảo, chưa phải trọng tâm vận hành ở giai đoạn này
+- `interface/`: giao diện Next.js làm control panel cho jobs, dashboard artifact và benchmark compare
 
 Nếu bạn mới clone repository, hãy bắt đầu từ `localagent/`.
 
@@ -66,7 +66,7 @@ Các khu vực quan trọng:
 
 ### `interface/`
 
-Đây là giao diện Next.js ở mức mẫu. Bạn có thể bỏ qua nếu đang tập trung vào dữ liệu, huấn luyện mô hình hoặc backend local.
+Đây là giao diện Next.js để chạy pipeline bằng nút bấm, xem jobs/logs và đọc dashboard artifact từ Actix.
 
 ## Công nghệ chính
 
@@ -143,13 +143,24 @@ cargo run --bin localagent-server
 
 Server hiện đã đọc được các JSON artifact của trainer để trả API cho UI/CLI, gồm:
 
+- `GET /jobs`
+- `POST /jobs/pipeline`
+- `POST /jobs/training`
+- `POST /jobs/benchmark`
+- `GET /runs`
+- `GET /runs/<experiment_name>`
+- `GET /runs/<experiment_name>/compare?with=<other_experiment>`
+- `GET /presets/training`
+- `GET /presets/pipeline`
 - `GET /dashboard/summary`
 - `GET /artifacts/overview`
 - `GET /artifacts/training`
 - `GET /artifacts/training-overview`
 - `GET /artifacts/evaluation`
 - `GET /artifacts/export`
+- `GET /artifacts/benchmark`
 - `GET /artifacts/benchmarks`
+- `GET /artifacts/experiment-spec`
 - `GET /artifacts/model-manifest`
 
 ## Hai pipeline chính
@@ -174,7 +185,23 @@ uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
 uv run python -m localagent.training.train evaluate
 uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train export-spec
+uv run python -m localagent.training.train benchmark
 uv run python -m localagent.training.train report
+```
+
+### Chạy GUI
+
+```powershell
+cd localagent
+cargo run --bin localagent-server
+```
+
+Mở terminal khác:
+
+```powershell
+cd interface
+bun run dev
 ```
 
 ## Pipeline dữ liệu ảnh thô

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from localagent.config import AgentPaths, DatasetPipelineConfig, TrainingConfig
 from localagent.data import DatasetPipeline
-from localagent.training import SUPPORTED_CNN_MODELS, WasteTrainer
+from localagent.training import SUPPORTED_CNN_MODELS, WasteTrainer, compare_benchmark_reports
 
 
 def _write_rgb_image(path: Path, width: int, height: int, value: int) -> None:
@@ -884,6 +884,161 @@ def test_build_artifact_report_bundles_existing_training_outputs(tmp_path: Path)
     assert report["evaluation"]["accuracy"] == 0.5
     assert report["export"]["onnx_path"] == "models/waste_classifier.onnx"
     assert report["model_manifest"]["labels"] == ["glass", "plastic"]
+
+
+def test_export_experiment_spec_writes_backend_metadata(tmp_path: Path) -> None:
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        TrainingConfig(
+            training_backend="pytorch",
+            experiment_name="demo-spec",
+            show_progress=False,
+        ),
+    )
+
+    spec_path = trainer.export_experiment_spec()
+    payload = json.loads(spec_path.read_text(encoding="utf-8"))
+
+    assert spec_path.is_file()
+    assert payload["experiment_name"] == "demo-spec"
+    assert payload["training_backend"] == "pytorch"
+    assert payload["backend_capability"]["supported"] is True
+
+
+def test_benchmark_writes_report_for_pytorch_backend(tmp_path: Path) -> None:
+    pipeline_config = _build_two_class_manifest(
+        tmp_path / "benchmark_run",
+        per_class=2,
+        random_seed=47,
+    )
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        TrainingConfig(
+            training_backend="pytorch",
+            experiment_name="benchmark-demo",
+            manifest_path=pipeline_config.manifest_path,
+            show_progress=False,
+        ),
+    )
+
+    trainer.fit = lambda manifest_path=None: {  # type: ignore[method-assign]
+        "best_checkpoint_path": str(tmp_path / "artifacts" / "checkpoints" / "benchmark-demo.pt"),
+        "best_loss": 0.42,
+        "best_epoch": 2,
+        "epochs_completed": 2,
+        "training_report_path": str(trainer._training_report_path()),
+    }
+    trainer.evaluate = lambda **kwargs: {  # type: ignore[method-assign]
+        "evaluation_report_path": str(trainer._evaluation_report_path()),
+        "accuracy": 0.8,
+        "macro_f1": 0.75,
+        "weighted_f1": 0.77,
+    }
+    trainer.export_onnx = lambda **kwargs: {  # type: ignore[method-assign]
+        "export_report_path": str(trainer._export_report_path()),
+        "verification": {"verified": True},
+    }
+    trainer.build_artifact_report = lambda manifest_path=None: {  # type: ignore[method-assign]
+        "artifact_bundle_path": str(trainer._artifact_bundle_path()),
+    }
+
+    summary = trainer.benchmark()
+    report_path = trainer._benchmark_report_path()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report_path.is_file()
+    assert summary["status"] == "completed"
+    assert payload["metrics"]["best_loss"] == 0.42
+    assert payload["metrics"]["accuracy"] == 0.8
+    assert payload["metrics"]["onnx_verified"] is True
+    assert set(payload["stages"]) == {"fit", "evaluate", "export_onnx", "report"}
+
+
+def test_benchmark_marks_rust_backend_as_unsupported(tmp_path: Path) -> None:
+    pipeline_config = _build_two_class_manifest(
+        tmp_path / "unsupported_run",
+        per_class=2,
+        random_seed=53,
+    )
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        TrainingConfig(
+            training_backend="rust_tch",
+            experiment_name="rust-preview",
+            manifest_path=pipeline_config.manifest_path,
+            show_progress=False,
+        ),
+    )
+
+    summary = trainer.benchmark()
+
+    assert summary["status"] == "unsupported"
+    assert summary["backend_capability"]["backend"] == "rust_tch"
+    assert summary["stages"] == {}
+
+
+def test_compare_benchmark_reports_returns_stage_and_metric_deltas(tmp_path: Path) -> None:
+    left_path = tmp_path / "left.json"
+    right_path = tmp_path / "right.json"
+    left_path.write_text(
+        json.dumps(
+            {
+                "training_backend": "pytorch",
+                "experiment_name": "baseline",
+                "stages": {"fit": {"duration_seconds": 12.0}},
+                "metrics": {
+                    "total_duration_seconds": 20.0,
+                    "accuracy": 0.78,
+                    "macro_f1": 0.74,
+                    "weighted_f1": 0.76,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    right_path.write_text(
+        json.dumps(
+            {
+                "training_backend": "rust_tch",
+                "experiment_name": "candidate",
+                "stages": {"fit": {"duration_seconds": 10.0}},
+                "metrics": {
+                    "total_duration_seconds": 17.5,
+                    "accuracy": 0.8,
+                    "macro_f1": 0.75,
+                    "weighted_f1": 0.78,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    comparison = compare_benchmark_reports(left_path, right_path)
+
+    assert comparison["duration_delta_seconds"] == -2.5
+    assert comparison["fit_stage_delta_seconds"] == -2.0
+    assert abs(float(comparison["accuracy_delta"]) - 0.02) < 1e-9
 
 
 def test_fit_prints_epoch_progress_when_progress_bars_are_disabled(

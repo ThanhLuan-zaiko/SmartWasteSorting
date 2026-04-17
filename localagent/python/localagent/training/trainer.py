@@ -6,6 +6,7 @@ import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import cv2
@@ -15,6 +16,12 @@ import polars as pl
 from localagent.bridge import RustAccelerationBridge
 from localagent.config import AgentPaths, TrainingConfig
 from localagent.data import DatasetIndex
+from localagent.training.benchmarking import (
+    ExperimentSpec,
+    ProcessMemorySampler,
+    bytes_to_megabytes,
+    compare_benchmark_reports,
+)
 from localagent.training.manifest_dataset import ManifestImageDataset
 from localagent.utils import TerminalProgressBar
 from localagent.vision import normalization_stats
@@ -42,6 +49,7 @@ class WasteTrainer:
         summary: dict[str, Any] = {
             "training_preset": self.config.training_preset,
             "experiment_name": self.config.experiment_name,
+            "training_backend": self.config.training_backend,
             "model_name": self.config.model_name,
             "pretrained_backbone": self.config.pretrained_backbone,
             "freeze_backbone": self.config.freeze_backbone,
@@ -53,6 +61,8 @@ class WasteTrainer:
             "artifact_dir": str(self.paths.artifact_dir),
             "manifest_path": str(self.config.manifest_path),
             "training_report_path": str(self._training_report_path()),
+            "experiment_spec_path": str(self._experiment_spec_path()),
+            "benchmark_report_path": str(self._benchmark_report_path()),
             "resume_from_checkpoint": (
                 None
                 if self.config.resume_from_checkpoint is None
@@ -80,6 +90,7 @@ class WasteTrainer:
             "early_stopping_patience": self.config.early_stopping_patience,
             "early_stopping_min_delta": self.config.early_stopping_min_delta,
             "enable_early_stopping": self.config.enable_early_stopping,
+            "backend_capability": self._training_backend_capability(),
         }
         frame = manifest_frame
         if frame is None and self.config.manifest_path.exists():
@@ -162,6 +173,7 @@ class WasteTrainer:
             self._freeze_model_backbone(model)
 
         self._last_model_metadata = {
+            "training_backend": self.config.training_backend,
             "model_name": self.config.model_name,
             "pretrained_backbone_requested": self.config.pretrained_backbone,
             "pretrained_backbone_loaded": pretrained_loaded,
@@ -344,6 +356,137 @@ class WasteTrainer:
         labels = self.class_names(frame)
         return self._write_labels_payload(labels, output_path=output_path)
 
+    def build_experiment_spec(self) -> dict[str, Any]:
+        spec = ExperimentSpec.from_training_config(self.config)
+        payload = spec.to_dict()
+        payload["generated_at"] = self._timestamp_now()
+        payload["backend_capability"] = self._training_backend_capability()
+        return payload
+
+    def export_experiment_spec(self, output_path: Path | None = None) -> Path:
+        destination = output_path or self._experiment_spec_path()
+        spec = ExperimentSpec.from_training_config(self.config)
+        payload = spec.to_dict()
+        payload["generated_at"] = self._timestamp_now()
+        payload["backend_capability"] = self._training_backend_capability()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return destination
+
+    def benchmark(
+        self,
+        *,
+        manifest_path: Path | None = None,
+        compare_to: Path | None = None,
+    ) -> dict[str, Any]:
+        manifest_frame = self.load_manifest(manifest_path)
+        capability = self._training_backend_capability()
+        benchmark_path = self._benchmark_report_path()
+        spec_path = self.export_experiment_spec()
+        report: dict[str, Any] = {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
+            "experiment_name": self.config.experiment_name,
+            "training_backend": self.config.training_backend,
+            "benchmark_report_path": str(benchmark_path),
+            "experiment_spec_path": str(spec_path),
+            "manifest_path": str(self.config.manifest_path),
+            "backend_capability": capability,
+            "summary": self.summarize_training_plan(manifest_frame=manifest_frame),
+            "stages": {},
+            "metrics": {},
+        }
+        if not capability["supported"]:
+            report["status"] = "unsupported"
+            if compare_to is not None:
+                report["comparison"] = self._compare_benchmark_path(compare_to, current=report)
+            self._write_json(benchmark_path, report)
+            return report
+
+        try:
+            fit_summary = self._run_benchmark_stage(
+                report["stages"],
+                "fit",
+                lambda: self.fit(manifest_path=manifest_path),
+            )
+            checkpoint_path = Path(str(fit_summary["best_checkpoint_path"]))
+            evaluation_summary = self._run_benchmark_stage(
+                report["stages"],
+                "evaluate",
+                lambda: self.evaluate(
+                    manifest_path=manifest_path,
+                    checkpoint_path=checkpoint_path,
+                ),
+            )
+            export_summary = self._run_benchmark_stage(
+                report["stages"],
+                "export_onnx",
+                lambda: self.export_onnx(
+                    manifest_path=manifest_path,
+                    checkpoint_path=checkpoint_path,
+                ),
+            )
+            bundle_summary = self._run_benchmark_stage(
+                report["stages"],
+                "report",
+                lambda: self.build_artifact_report(manifest_path=manifest_path),
+            )
+        except Exception as error:
+            report["status"] = "failed"
+            report["error"] = f"{type(error).__name__}: {error}"
+            self._write_json(benchmark_path, report)
+            raise
+
+        total_duration_seconds = sum(
+            float(stage.get("duration_seconds", 0.0))
+            for stage in report["stages"].values()
+            if isinstance(stage, dict)
+        )
+        peak_stage_rss_mb = max(
+            (
+                float(stage["peak_rss_mb"])
+                for stage in report["stages"].values()
+                if isinstance(stage, dict) and stage.get("peak_rss_mb") is not None
+            ),
+            default=0.0,
+        )
+
+        evaluation_metrics = (
+            evaluation_summary if isinstance(evaluation_summary, dict) else None
+        )
+        report["status"] = "completed"
+        report["metrics"] = {
+            "total_duration_seconds": total_duration_seconds,
+            "peak_stage_rss_mb": peak_stage_rss_mb,
+            "best_loss": float(fit_summary["best_loss"]),
+            "best_epoch": int(fit_summary["best_epoch"]),
+            "epochs_completed": int(fit_summary["epochs_completed"]),
+            "accuracy": (
+                None
+                if evaluation_metrics is None
+                else float(evaluation_metrics.get("accuracy"))
+            ),
+            "macro_f1": (
+                None
+                if evaluation_metrics is None
+                else float(evaluation_metrics.get("macro_f1"))
+            ),
+            "weighted_f1": (
+                None
+                if evaluation_metrics is None
+                else float(evaluation_metrics.get("weighted_f1"))
+            ),
+            "onnx_verified": bool(export_summary.get("verification", {}).get("verified")),
+            "artifact_bundle_path": str(bundle_summary.get("artifact_bundle_path")),
+        }
+        if compare_to is not None:
+            report["comparison"] = self._compare_benchmark_path(compare_to, current=report)
+        self._write_json(benchmark_path, report)
+        return report
+
     def _compute_best_loss_from_history(self, history: list[dict[str, Any]]) -> float:
         best_loss = float("inf")
         for epoch_summary in history:
@@ -452,6 +595,7 @@ class WasteTrainer:
             "history": history,
             "experiment_name": self.config.experiment_name,
             "training_preset": self.config.training_preset,
+            "training_backend": self.config.training_backend,
             "best_epoch": best_epoch,
             "best_loss": best_loss,
             "last_completed_epoch": last_completed_epoch,
@@ -464,6 +608,7 @@ class WasteTrainer:
             ),
             "model": self._last_model_metadata,
             "training_config": {
+                "training_backend": self.config.training_backend,
                 "model_name": self.config.model_name,
                 "image_size": self.config.image_size,
                 "normalization_preset": self.config.normalization_preset,
@@ -613,12 +758,115 @@ class WasteTrainer:
                 writer.writerow([label, *row])
         return report_path, confusion_path
 
+    def _training_backend_capability(self) -> dict[str, Any]:
+        if self.config.training_backend == "pytorch":
+            return {
+                "backend": "pytorch",
+                "supported": True,
+                "maturity": "stable",
+                "notes": "Full training loop uses PyTorch autograd and optimizer.",
+            }
+        if self.config.training_backend == "rust_tch":
+            return {
+                "backend": "rust_tch",
+                "supported": False,
+                "maturity": "planned",
+                "notes": (
+                    "Rust training backend scaffolding is present, but the full tch-based "
+                    "training core is not implemented in this build."
+                ),
+            }
+        return {
+            "backend": self.config.training_backend,
+            "supported": False,
+            "maturity": "unknown",
+            "notes": "Unsupported training backend.",
+        }
+
+    def _ensure_training_backend_supported(self, *, operation: str) -> None:
+        capability = self._training_backend_capability()
+        if capability["supported"]:
+            return
+        raise NotImplementedError(
+            f"Training backend `{self.config.training_backend}` is unavailable for {operation}. "
+            f"{capability['notes']}"
+        )
+
+    def _run_benchmark_stage(
+        self,
+        stages: dict[str, dict[str, Any]],
+        stage_name: str,
+        runner,
+    ) -> dict[str, Any]:
+        started_at = self._timestamp_now()
+        started = perf_counter()
+        with ProcessMemorySampler() as memory_sampler:
+            try:
+                result = runner()
+            except Exception as error:
+                duration_seconds = perf_counter() - started
+                stages[stage_name] = {
+                    "started_at": started_at,
+                    "duration_seconds": duration_seconds,
+                    "peak_rss_mb": bytes_to_megabytes(memory_sampler.peak_rss_bytes),
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                raise
+
+        duration_seconds = perf_counter() - started
+        stages[stage_name] = {
+            "started_at": started_at,
+            "duration_seconds": duration_seconds,
+            "peak_rss_mb": bytes_to_megabytes(memory_sampler.peak_rss_bytes),
+            "status": "completed",
+        }
+        if isinstance(result, dict):
+            stages[stage_name]["result_path"] = self._stage_result_path(result)
+            return result
+        return {"value": result}
+
+    def _compare_benchmark_path(
+        self,
+        compare_to: Path,
+        *,
+        current: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if current is None:
+            return compare_benchmark_reports(compare_to, self._benchmark_report_path())
+
+        temp_path = self._benchmark_report_path().with_name(
+            f"{self.config.experiment_name}_benchmark.preview.json"
+        )
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            return compare_benchmark_reports(compare_to, temp_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+    def _stage_result_path(self, result: dict[str, Any]) -> str | None:
+        for key in (
+            "training_report_path",
+            "evaluation_report_path",
+            "export_report_path",
+            "artifact_bundle_path",
+            "benchmark_report_path",
+            "checkpoint_path",
+        ):
+            value = result.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
     def evaluate(
         self,
         *,
         manifest_path: Path | None = None,
         checkpoint_path: Path | None = None,
     ) -> dict[str, Any]:
+        self._ensure_training_backend_supported(operation="evaluate")
         import torch.nn as nn
 
         frame = self.load_manifest(manifest_path)
@@ -689,6 +937,7 @@ class WasteTrainer:
         report_path, confusion_path = self._write_evaluation_artifacts(evaluation)
         summary = {
             "checkpoint_path": str(checkpoint_source),
+            "training_backend": self.config.training_backend,
             "evaluation_report_path": str(report_path),
             "confusion_matrix_path": str(confusion_path),
             "split": split_name,
@@ -708,6 +957,7 @@ class WasteTrainer:
         checkpoint_path: Path | None = None,
         output_path: Path | None = None,
     ) -> dict[str, Any]:
+        self._ensure_training_backend_supported(operation="export-onnx")
         import onnx
         import onnxruntime as ort
         import torch
@@ -804,6 +1054,7 @@ class WasteTrainer:
             "schema_version": 1,
             "generated_at": self._timestamp_now(),
             "experiment_name": self.config.experiment_name,
+            "training_backend": self.config.training_backend,
             "checkpoint_path": str(checkpoint_source),
             "onnx_path": str(destination),
             "labels_path": str(labels_path),
@@ -849,6 +1100,8 @@ class WasteTrainer:
             "schema_version": 1,
             "generated_at": self._timestamp_now(),
             "experiment_name": self.config.experiment_name,
+            "training_backend": self.config.training_backend,
+            "artifact_bundle_path": str(self._artifact_bundle_path()),
             "training_plan": self.summarize_training_plan(manifest_frame=frame),
             "dataset_summary": self._read_json(
                 self.paths.artifact_dir / "reports" / "summary.json"
@@ -856,6 +1109,8 @@ class WasteTrainer:
             "training": self._read_json(self._training_report_path()),
             "evaluation": self._read_json(self._evaluation_report_path()),
             "export": self._read_json(self._export_report_path()),
+            "benchmark": self._read_json(self._benchmark_report_path()),
+            "experiment_spec": self._read_json(self._experiment_spec_path()),
             "model_manifest": self._read_json(self._model_manifest_path()),
         }
         self._write_json(self._artifact_bundle_path(), report)
@@ -865,6 +1120,7 @@ class WasteTrainer:
         self,
         manifest_path: Path | None = None,
     ) -> dict[str, Any]:
+        self._ensure_training_backend_supported(operation="fit")
         import torch
         import torch.nn as nn
 
@@ -1063,9 +1319,12 @@ class WasteTrainer:
             "best_checkpoint_path": str(best_checkpoint_path),
             "latest_checkpoint_path": str(latest_checkpoint_path),
             "training_preset": self.config.training_preset,
+            "training_backend": self.config.training_backend,
             "experiment_name": self.config.experiment_name,
             "labels_path": str(labels_path),
             "training_report_path": str(self._training_report_path()),
+            "benchmark_report_path": str(self._benchmark_report_path()),
+            "experiment_spec_path": str(self._experiment_spec_path()),
             "num_classes": len(label_to_index),
             "best_epoch": best_epoch,
             "best_loss": best_loss,
@@ -1378,6 +1637,20 @@ class WasteTrainer:
 
     def _training_report_path(self) -> Path:
         return self.paths.artifact_dir / "reports" / f"{self.config.experiment_name}_training.json"
+
+    def _experiment_spec_path(self) -> Path:
+        return (
+            self.paths.artifact_dir
+            / "reports"
+            / f"{self.config.experiment_name}_experiment_spec.json"
+        )
+
+    def _benchmark_report_path(self) -> Path:
+        return (
+            self.paths.artifact_dir
+            / "reports"
+            / f"{self.config.experiment_name}_benchmark.json"
+        )
 
     def _export_report_path(self) -> Path:
         return self.paths.artifact_dir / "reports" / f"{self.config.experiment_name}_export.json"

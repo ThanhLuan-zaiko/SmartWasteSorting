@@ -1,9 +1,13 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_ws::{Message, MessageStream, Session};
+use futures_util::StreamExt;
 use localagent_rs::{
-    init_tracing, to_api_envelope, ArtifactKind, ArtifactStore, RuntimeConfig, WasteClassifier,
+    init_tracing, to_api_envelope, ArtifactKind, ArtifactStore, BenchmarkJobRequest, JobManager,
+    JobStreamEvent, PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier,
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::{sync::broadcast, time::Duration};
 
 #[derive(Debug, Deserialize)]
 struct ClassificationRequest {
@@ -15,13 +19,41 @@ struct ArtifactQuery {
     experiment: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct JobLogsQuery {
+    tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobStreamQuery {
+    job_id: Option<String>,
+    tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompareQuery {
+    #[serde(rename = "with")]
+    with_experiment: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentPath {
+    experiment_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobPath {
+    job_id: String,
+}
+
 #[get("/health")]
-async fn health(store: web::Data<ArtifactStore>) -> impl Responder {
+async fn health(store: web::Data<ArtifactStore>, jobs: web::Data<JobManager>) -> impl Responder {
     let experiment = store.default_experiment().to_string();
     HttpResponse::Ok().json(json!({
         "status": "ok",
         "service": "localagent-server",
         "default_experiment": experiment,
+        "jobs_tracked": jobs.list_jobs().len(),
         "artifacts": {
             "training": store
                 .artifact_path(ArtifactKind::Training, Some(store.default_experiment()))
@@ -32,6 +64,13 @@ async fn health(store: web::Data<ArtifactStore>) -> impl Responder {
             "export": store
                 .artifact_path(ArtifactKind::Export, Some(store.default_experiment()))
                 .is_file(),
+            "benchmark": store
+                .artifact_path(ArtifactKind::Benchmark, Some(store.default_experiment()))
+                .is_file(),
+            "experiment_spec": store
+                .artifact_path(ArtifactKind::ExperimentSpec, Some(store.default_experiment()))
+                .is_file(),
+            "run_index": store.run_index().is_ok(),
             "model_manifest": store
                 .artifact_path(ArtifactKind::ModelManifest, None)
                 .is_file(),
@@ -50,6 +89,214 @@ async fn classify(
             "error": error.to_string(),
         })),
     }
+}
+
+#[get("/jobs")]
+async fn list_jobs(manager: web::Data<JobManager>) -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "schema_version": 1,
+        "jobs": manager.list_jobs(),
+    }))
+}
+
+#[get("/jobs/{job_id}")]
+async fn get_job(manager: web::Data<JobManager>, path: web::Path<JobPath>) -> impl Responder {
+    match manager.get_job(&path.job_id) {
+        Some(job) => HttpResponse::Ok().json(job),
+        None => HttpResponse::NotFound().json(json!({
+            "error": "job not found",
+            "job_id": path.job_id,
+        })),
+    }
+}
+
+#[post("/jobs/pipeline")]
+async fn create_pipeline_job(
+    manager: web::Data<JobManager>,
+    request: web::Json<PipelineJobRequest>,
+) -> impl Responder {
+    match manager.spawn_pipeline_job(request.into_inner()).await {
+        Ok(job) => HttpResponse::Accepted().json(job),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[post("/jobs/training")]
+async fn create_training_job(
+    manager: web::Data<JobManager>,
+    request: web::Json<TrainingJobRequest>,
+) -> impl Responder {
+    match manager.spawn_training_job(request.into_inner()).await {
+        Ok(job) => HttpResponse::Accepted().json(job),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[post("/jobs/benchmark")]
+async fn create_benchmark_job(
+    manager: web::Data<JobManager>,
+    request: web::Json<BenchmarkJobRequest>,
+) -> impl Responder {
+    match manager.spawn_benchmark_job(request.into_inner()).await {
+        Ok(job) => HttpResponse::Accepted().json(job),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[post("/jobs/{job_id}/cancel")]
+async fn cancel_job(manager: web::Data<JobManager>, path: web::Path<JobPath>) -> impl Responder {
+    match manager.cancel_job(&path.job_id).await {
+        Ok(job) => HttpResponse::Ok().json(job),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+            "job_id": path.job_id,
+        })),
+    }
+}
+
+#[get("/jobs/{job_id}/logs")]
+async fn job_logs(
+    manager: web::Data<JobManager>,
+    path: web::Path<JobPath>,
+    query: web::Query<JobLogsQuery>,
+) -> impl Responder {
+    match manager.job_logs(&path.job_id, query.tail_lines) {
+        Ok(payload) => HttpResponse::Ok().json(payload),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+            "job_id": path.job_id,
+        })),
+    }
+}
+
+#[get("/ws/jobs")]
+async fn jobs_ws(
+    request: HttpRequest,
+    payload: web::Payload,
+    manager: web::Data<JobManager>,
+    query: web::Query<JobStreamQuery>,
+) -> actix_web::Result<HttpResponse> {
+    let (response, session, msg_stream) = actix_ws::handle(&request, payload)?;
+    let manager = manager.get_ref().clone();
+    let query = query.into_inner();
+
+    actix_web::rt::spawn(async move {
+        stream_job_events(session, msg_stream, manager, query).await;
+    });
+
+    Ok(response)
+}
+
+#[get("/runs")]
+async fn list_runs(store: web::Data<ArtifactStore>) -> impl Responder {
+    match store.run_index() {
+        Ok(payload) => HttpResponse::Ok().json(payload),
+        Err(error) => HttpResponse::InternalServerError().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[get("/runs/{experiment_name}")]
+async fn run_detail(
+    store: web::Data<ArtifactStore>,
+    jobs: web::Data<JobManager>,
+    path: web::Path<ExperimentPath>,
+) -> impl Responder {
+    match store.run_detail(Some(&path.experiment_name)) {
+        Ok(mut payload) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "job_history".to_string(),
+                    json!(jobs.jobs_for_experiment(&path.experiment_name)),
+                );
+            }
+            HttpResponse::Ok().json(payload)
+        }
+        Err(error) => HttpResponse::InternalServerError().json(json!({
+            "error": error.to_string(),
+            "experiment_name": path.experiment_name,
+        })),
+    }
+}
+
+#[get("/runs/{experiment_name}/compare")]
+async fn compare_runs(
+    store: web::Data<ArtifactStore>,
+    path: web::Path<ExperimentPath>,
+    query: web::Query<CompareQuery>,
+) -> impl Responder {
+    match store.compare_runs(&path.experiment_name, &query.with_experiment) {
+        Ok(payload) => HttpResponse::Ok().json(payload),
+        Err(error) => HttpResponse::BadRequest().json(json!({
+            "error": error.to_string(),
+            "left_experiment_name": path.experiment_name,
+            "right_experiment_name": query.with_experiment,
+        })),
+    }
+}
+
+#[get("/presets/training")]
+async fn training_presets() -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "schema_version": 1,
+        "presets": {
+            "cpu_fast": {
+                "model_name": "mobilenet_v3_small",
+                "image_size": 160,
+                "batch_size": 32,
+                "cache_format": "raw",
+                "class_bias": "loss",
+            },
+            "cpu_balanced": {
+                "model_name": "resnet18",
+                "image_size": 224,
+                "batch_size": 16,
+                "cache_format": "raw",
+                "class_bias": "loss",
+            },
+            "cpu_stronger": {
+                "model_name": "efficientnet_b0",
+                "image_size": 224,
+                "batch_size": 8,
+                "cache_format": "raw",
+                "class_bias": "loss",
+            }
+        }
+    }))
+}
+
+#[get("/presets/pipeline")]
+async fn pipeline_presets() -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "schema_version": 1,
+        "dataset_commands": [
+            "scan",
+            "split",
+            "report",
+            "run-all",
+            "export-labeling-template",
+            "import-labels",
+            "validate-labels"
+        ],
+        "training_commands": [
+            "summary",
+            "export-spec",
+            "export-labels",
+            "warm-cache",
+            "fit",
+            "evaluate",
+            "export-onnx",
+            "report",
+            "benchmark"
+        ]
+    }))
 }
 
 #[get("/artifacts/overview")]
@@ -103,6 +350,26 @@ async fn artifacts_benchmarks(
             "error": error.to_string(),
         })),
     }
+}
+
+#[get("/artifacts/benchmark")]
+async fn artifacts_benchmark(
+    store: web::Data<ArtifactStore>,
+    query: web::Query<ArtifactQuery>,
+) -> impl Responder {
+    artifact_response(&store, ArtifactKind::Benchmark, query.experiment.as_deref())
+}
+
+#[get("/artifacts/experiment-spec")]
+async fn artifacts_experiment_spec(
+    store: web::Data<ArtifactStore>,
+    query: web::Query<ArtifactQuery>,
+) -> impl Responder {
+    artifact_response(
+        &store,
+        ArtifactKind::ExperimentSpec,
+        query.experiment.as_deref(),
+    )
 }
 
 #[get("/dashboard/summary")]
@@ -201,6 +468,98 @@ fn artifact_response(
     }
 }
 
+async fn stream_job_events(
+    mut session: Session,
+    mut msg_stream: MessageStream,
+    manager: JobManager,
+    query: JobStreamQuery,
+) {
+    let mut receiver = manager.subscribe_events();
+    let active_job_id = query.job_id.clone();
+    let tail_lines = query.tail_lines;
+
+    match manager.stream_snapshot(active_job_id.as_deref(), tail_lines) {
+        Ok(snapshot) => {
+            if send_stream_event(&mut session, &snapshot).await.is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send_stream_event(
+                &mut session,
+                &JobStreamEvent::ResyncRequired {
+                    reason: error.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+
+    loop {
+        tokio::select! {
+            maybe_message = msg_stream.next() => match maybe_message {
+                Some(Ok(Message::Ping(bytes))) => {
+                    if session.pong(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(reason))) => {
+                    let _ = session.close(reason).await;
+                    break;
+                }
+                Some(Ok(Message::Pong(_)))
+                | Some(Ok(Message::Text(_)))
+                | Some(Ok(Message::Binary(_)))
+                | Some(Ok(Message::Continuation(_)))
+                | Some(Ok(Message::Nop)) => {}
+                Some(Err(_)) | None => break,
+            },
+            received = receiver.recv() => match received {
+                Ok(event) => {
+                    if event.matches_job(active_job_id.as_deref())
+                        && send_stream_event(&mut session, &event).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let reason = format!("Lagged behind the job stream by {skipped} messages.");
+                    if send_stream_event(
+                        &mut session,
+                        &JobStreamEvent::ResyncRequired { reason },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    match manager.stream_snapshot(active_job_id.as_deref(), tail_lines) {
+                        Ok(snapshot) => {
+                            if send_stream_event(&mut session, &snapshot).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = heartbeat.tick() => {
+                if session.ping(b"localagent").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_stream_event(session: &mut Session, event: &JobStreamEvent) -> Result<(), ()> {
+    let payload = serde_json::to_string(event).map_err(|_| ())?;
+    session.text(payload).await.map_err(|_| ())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = init_tracing();
@@ -208,17 +567,34 @@ async fn main() -> std::io::Result<()> {
     let config = RuntimeConfig::default();
     let bind_address = config.server_addr();
     let classifier = web::Data::new(WasteClassifier::new(config.clone()));
-    let artifact_store = web::Data::new(ArtifactStore::new(config));
+    let artifact_store = web::Data::new(ArtifactStore::new(config.clone()));
+    let job_manager = web::Data::new(JobManager::new(config));
 
     HttpServer::new(move || {
         App::new()
             .app_data(classifier.clone())
             .app_data(artifact_store.clone())
+            .app_data(job_manager.clone())
             .service(health)
             .service(classify)
+            .service(list_jobs)
+            .service(get_job)
+            .service(create_pipeline_job)
+            .service(create_training_job)
+            .service(create_benchmark_job)
+            .service(cancel_job)
+            .service(job_logs)
+            .service(jobs_ws)
+            .service(list_runs)
+            .service(run_detail)
+            .service(compare_runs)
+            .service(training_presets)
+            .service(pipeline_presets)
             .service(artifacts_overview)
             .service(artifacts_training_overview)
             .service(artifacts_benchmarks)
+            .service(artifacts_benchmark)
+            .service(artifacts_experiment_spec)
             .service(dashboard_summary)
             .service(artifacts_dataset)
             .service(artifacts_training)

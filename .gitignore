@@ -30,6 +30,7 @@ node_modules/
 !.yarn/releases
 !.yarn/versions
 .next/
+interface/.next-build*/
 out/
 coverage/
 .turbo/

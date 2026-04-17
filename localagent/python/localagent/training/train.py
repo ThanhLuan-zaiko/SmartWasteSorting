@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from localagent.config import AgentPaths, TrainingConfig
-from localagent.training import WasteTrainer
+from localagent.training import SUPPORTED_TRAINING_BACKENDS, WasteTrainer, compare_benchmark_reports
 
 TRAINING_PRESETS: dict[str, dict[str, object]] = {
     "cpu_fast": {
@@ -55,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--manifest", type=Path, default=None)
     common.add_argument("--training-preset", choices=tuple(TRAINING_PRESETS), default=None)
     common.add_argument("--experiment-name", type=str, default=None)
+    common.add_argument(
+        "--training-backend",
+        choices=SUPPORTED_TRAINING_BACKENDS,
+        default=None,
+    )
     common.add_argument("--model-name", type=str, default=None)
     common.add_argument("--no-pretrained", action="store_true")
     common.add_argument("--train-backbone", action="store_true")
@@ -67,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--resume-from", type=Path, default=None)
     common.add_argument("--checkpoint", type=Path, default=None)
     common.add_argument("--onnx-output", type=Path, default=None)
+    common.add_argument("--spec-output", type=Path, default=None)
     common.add_argument("--cache-format", choices=("png", "raw"), default=None)
     common.add_argument("--no-rust-cache", action="store_true")
     common.add_argument("--force-cache", action="store_true")
@@ -80,12 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--no-progress", action="store_true")
 
     subparsers.add_parser("summary", parents=[common])
+    subparsers.add_parser("export-spec", parents=[common])
     subparsers.add_parser("export-labels", parents=[common])
     subparsers.add_parser("warm-cache", parents=[common])
     subparsers.add_parser("fit", parents=[common])
     subparsers.add_parser("evaluate", parents=[common])
     subparsers.add_parser("export-onnx", parents=[common])
     subparsers.add_parser("report", parents=[common])
+    benchmark_parser = subparsers.add_parser("benchmark", parents=[common])
+    benchmark_parser.add_argument("--compare-to", type=Path, default=None)
+    compare_parser = subparsers.add_parser("compare-benchmarks")
+    compare_parser.add_argument("--left-report", type=Path, required=True)
+    compare_parser.add_argument("--right-report", type=Path, required=True)
     return parser
 
 
@@ -97,6 +109,11 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         training_preset=preset_name,
         experiment_name=(
             defaults.experiment_name if args.experiment_name is None else args.experiment_name
+        ),
+        training_backend=(
+            defaults.training_backend
+            if args.training_backend is None
+            else args.training_backend
         ),
         model_name=_resolve_value(
             args.model_name,
@@ -177,11 +194,22 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "compare-benchmarks":
+        summary = compare_benchmark_reports(args.left_report, args.right_report)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
     trainer = WasteTrainer(AgentPaths().ensure_layout(), build_config(args))
 
     if args.command == "summary":
         summary = trainer.summarize_training_plan()
         print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "export-spec":
+        spec_path = trainer.export_experiment_spec(output_path=args.spec_output)
+        print(f"Exported experiment spec to {spec_path}")
         return 0
 
     if args.command == "export-labels":
@@ -209,6 +237,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "report":
         summary = trainer.build_artifact_report()
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "benchmark":
+        summary = trainer.benchmark(compare_to=args.compare_to)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 

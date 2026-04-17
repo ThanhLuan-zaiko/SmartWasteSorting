@@ -56,6 +56,7 @@ class RuntimeConfig:
 class TrainingConfig:
     training_preset: str | None = None
     experiment_name: str = "baseline-waste-sorter"
+    training_backend: str = "pytorch"
     model_name: str = "mobilenet_v3_small"
     pretrained_backbone: bool = True
     freeze_backbone: bool = True

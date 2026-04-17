@@ -14,7 +14,9 @@ path = "src/bin/server.rs"
 
 [dependencies]
 actix-web = "4.9"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal"] }
+actix-ws = "0.3"
+futures-util = "0.3"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,3 +28,4 @@ pyo3 = { version = "0.22", features = ["abi3-py311", "extension-module"] }
 ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
 image = "0.25"
 indicatif = "0.17"
+time = { version = "0.3", features = ["formatting"] }

@@ -42,6 +42,7 @@ def test_runtime_and_training_defaults_are_stable() -> None:
     assert runtime.artifact_dir.name == "artifacts"
     assert runtime.experiment_name == "baseline-waste-sorter"
     assert training.training_preset is None
+    assert training.training_backend == "pytorch"
     assert training.model_name == "mobilenet_v3_small"
     assert training.pretrained_backbone is True
     assert training.batch_size == 16

@@ -3,6 +3,7 @@ mod config;
 mod domain;
 mod error;
 mod inference;
+mod jobs;
 mod python_api;
 mod telemetry;
 mod training_cache;
@@ -13,6 +14,10 @@ pub use config::RuntimeConfig;
 pub use domain::{ClassificationResult, Prediction};
 pub use error::AgentError;
 pub use inference::WasteClassifier;
+pub use jobs::{
+    BenchmarkJobRequest, JobLogStream, JobLogsSnapshot, JobManager, JobRecord, JobStatus,
+    JobStreamEvent, PipelineCommand, PipelineJobRequest, TrainingCommand, TrainingJobRequest,
+};
 pub use telemetry::init_tracing;
 pub use training_metrics::{build_classification_report, compute_class_weight_map};
 

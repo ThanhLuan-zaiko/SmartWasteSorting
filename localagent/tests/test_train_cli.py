@@ -108,3 +108,20 @@ def test_build_config_accepts_onnx_export_flags() -> None:
     assert config.onnx_opset == 18
     assert config.export_batch_size == 2
     assert config.verify_onnx is False
+
+
+def test_build_config_accepts_training_backend_for_benchmark() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "--training-backend",
+            "rust_tch",
+            "--spec-output",
+            "artifacts/reports/demo_experiment_spec.json",
+        ]
+    )
+    config = build_config(args)
+
+    assert config.training_backend == "rust_tch"

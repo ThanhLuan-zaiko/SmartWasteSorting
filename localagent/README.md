@@ -45,6 +45,9 @@ uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
 uv run python -m localagent.training.train evaluate
 uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train export-spec
+uv run python -m localagent.training.train benchmark
+uv run python -m localagent.training.train compare-benchmarks --left-report artifacts/reports/baseline_benchmark.json --right-report artifacts/reports/rust_candidate_benchmark.json
 uv run python -m localagent.training.train report
 ```
 
@@ -103,6 +106,8 @@ uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
 uv run python -m localagent.training.train evaluate
 uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train export-spec
+uv run python -m localagent.training.train benchmark
 uv run python -m localagent.training.train report
 ```
 
@@ -127,6 +132,9 @@ uv run python -m localagent.training.train fit --class-bias loss
 uv run python -m localagent.training.train fit --class-bias sampler
 uv run python -m localagent.training.train fit --class-bias both
 uv run python -m localagent.training.train fit --early-stopping-patience 2
+uv run python -m localagent.training.train benchmark --training-backend pytorch --experiment-name waste-benchmark-pytorch
+uv run python -m localagent.training.train benchmark --training-backend rust_tch --experiment-name waste-benchmark-rust
+uv run python -m localagent.training.train export-spec --training-backend rust_tch
 ```
 
 Khi dùng `--no-progress`, trainer sẽ tắt progress bar dạng thanh nhưng vẫn in snapshot tiến độ theo batch và summary theo epoch để theo dõi các run dài.
@@ -139,6 +147,8 @@ Trainer hiện sẽ tự lưu:
 - confusion matrix ở `artifacts/reports/<experiment_name>_confusion_matrix.csv`
 - báo cáo train ở `artifacts/reports/<experiment_name>_training.json`
 - báo cáo export ở `artifacts/reports/<experiment_name>_export.json`
+- benchmark report ở `artifacts/reports/<experiment_name>_benchmark.json`
+- experiment spec ở `artifacts/reports/<experiment_name>_experiment_spec.json`
 - model manifest ở `models/model_manifest.json`
 
 ### 3. API artifact từ Actix
@@ -154,19 +164,56 @@ Các endpoint chính:
 
 - `GET /health`
 - `POST /classify`
+- `GET /jobs`
+- `GET /jobs/<job_id>`
+- `POST /jobs/pipeline`
+- `POST /jobs/training`
+- `POST /jobs/benchmark`
+- `POST /jobs/<job_id>/cancel`
+- `GET /jobs/<job_id>/logs`
+- `GET /runs`
+- `GET /runs/<experiment_name>`
+- `GET /runs/<experiment_name>/compare?with=<other_experiment>`
+- `GET /presets/training`
+- `GET /presets/pipeline`
 - `GET /dashboard/summary?experiment=<name>`
 - `GET /artifacts/overview?experiment=<name>`
 - `GET /artifacts/training?experiment=<name>`
 - `GET /artifacts/training-overview?experiment=<name>`
 - `GET /artifacts/evaluation?experiment=<name>`
 - `GET /artifacts/export?experiment=<name>`
+- `GET /artifacts/benchmark?experiment=<name>`
 - `GET /artifacts/benchmarks?experiment=<name>`
+- `GET /artifacts/experiment-spec?experiment=<name>`
 - `GET /artifacts/model-manifest`
 
-### 4. Rust đang hỗ trợ gì cho training
+### 4. GUI điều khiển pipeline
+
+Interface Next.js bây giờ không còn là trang mẫu tĩnh. Nó đã trở thành control panel để:
+
+- bấm chạy từng dataset/training pipeline thay cho gõ CLI dài
+- xem jobs, logs, run history và benchmark compare
+- đọc artifact JSON qua API Actix để hiển thị cards, loss curves, confusion matrix, per-class metrics
+
+Chạy GUI cục bộ:
+
+```powershell
+cd localagent
+cargo run --bin localagent-server
+```
+
+Mở thêm terminal khác:
+
+```powershell
+cd interface
+bun run dev
+```
+
+### 5. Rust đang hỗ trợ gì cho training
 
 - Rust hỗ trợ mạnh ở phần warm-cache ảnh, đọc artifact JSON và API benchmark/report.
 - Rust hiện cũng hỗ trợ tính `class_weight_map` và classification report cho benchmark qua bridge.
+- CLI train hiện có `--training-backend pytorch|rust_tch`; trong build này `pytorch` là backend chạy thật, còn `rust_tch` dùng để khóa contract benchmark/spec và báo trạng thái `planned`.
 - Phần forward/backward, update weight/bias theo epoch vẫn do PyTorch native backend đảm nhiệm.
 - Nếu muốn Rust tham gia trực tiếp vào optimizer/backprop, bước tiếp theo sẽ là tách trainer sang stack như `tch`, `burn` hoặc `candle`, không chỉ thêm helper quanh pipeline hiện tại.
 
