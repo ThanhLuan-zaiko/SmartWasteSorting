@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use image::{imageops::FilterType, ImageFormat};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -14,6 +14,7 @@ pub struct CacheBuildSummary {
     pub skipped: usize,
     pub errors: usize,
     pub cache_dir: String,
+    pub cache_format: String,
     pub failure_report_path: Option<String>,
     pub image_size: u32,
 }
@@ -25,11 +26,42 @@ pub struct CacheFailureRecord {
     pub error: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum CacheFormat {
+    Png,
+    Raw,
+}
+
+impl CacheFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "png" => Ok(Self::Png),
+            "raw" => Ok(Self::Raw),
+            other => Err(anyhow!("unsupported cache format: {other}")),
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Raw => "raw",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Raw => "raw",
+        }
+    }
+}
+
 pub fn build_training_cache(
     entries: &[(String, String)],
     cache_dir: &Path,
     failure_report_path: Option<&Path>,
     image_size: u32,
+    cache_format: CacheFormat,
     force: bool,
     show_progress: bool,
 ) -> Result<CacheBuildSummary> {
@@ -53,12 +85,13 @@ pub fn build_training_cache(
     let results = entries
         .par_iter()
         .map(|(sample_id, image_path)| {
-            let output_path = cache_output_path(cache_dir, sample_id);
+            let output_path = cache_output_path(cache_dir, sample_id, cache_format);
             let result = prepare_single_image(
                 sample_id,
                 Path::new(image_path),
                 &output_path,
                 image_size,
+                cache_format,
                 force,
             );
             if let Some(bar) = &progress {
@@ -103,6 +136,7 @@ pub fn build_training_cache(
         skipped,
         errors,
         cache_dir: cache_dir.display().to_string(),
+        cache_format: cache_format.as_str().to_string(),
         failure_report_path: failure_report_path.map(|path| path.display().to_string()),
         image_size,
     })
@@ -118,6 +152,7 @@ fn prepare_single_image(
     image_path: &Path,
     output_path: &Path,
     image_size: u32,
+    cache_format: CacheFormat,
     force: bool,
 ) -> Result<CacheOutcome> {
     if output_path.exists() && !force {
@@ -136,19 +171,31 @@ fn prepare_single_image(
         image_size,
         FilterType::Triangle,
     );
-    resized
-        .save_with_format(output_path, ImageFormat::Png)
-        .with_context(|| {
-            format!(
-                "failed to write cached image for sample {sample_id}: {}",
-                output_path.display()
-            )
-        })?;
+    match cache_format {
+        CacheFormat::Png => {
+            resized
+                .save_with_format(output_path, ImageFormat::Png)
+                .with_context(|| {
+                    format!(
+                        "failed to write cached image for sample {sample_id}: {}",
+                        output_path.display()
+                    )
+                })?;
+        }
+        CacheFormat::Raw => {
+            std::fs::write(output_path, resized.as_raw()).with_context(|| {
+                format!(
+                    "failed to write raw cached image for sample {sample_id}: {}",
+                    output_path.display()
+                )
+            })?;
+        }
+    }
     Ok(CacheOutcome::Written)
 }
 
-fn cache_output_path(cache_dir: &Path, sample_id: &str) -> PathBuf {
-    cache_dir.join(format!("{sample_id}.png"))
+fn cache_output_path(cache_dir: &Path, sample_id: &str, cache_format: CacheFormat) -> PathBuf {
+    cache_dir.join(format!("{sample_id}.{}", cache_format.extension()))
 }
 
 fn write_failure_report(report_path: &Path, failures: &[CacheFailureRecord]) -> Result<()> {
@@ -174,7 +221,7 @@ fn write_failure_report(report_path: &Path, failures: &[CacheFailureRecord]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::build_training_cache;
+    use super::{build_training_cache, CacheFormat};
 
     #[test]
     fn writes_failure_report_for_unreadable_images() {
@@ -195,9 +242,16 @@ mod tests {
             ("broken".to_string(), invalid_path.display().to_string()),
         ];
 
-        let summary =
-            build_training_cache(&entries, &cache_dir, Some(&report_path), 32, false, false)
-                .expect("cache build failed");
+        let summary = build_training_cache(
+            &entries,
+            &cache_dir,
+            Some(&report_path),
+            32,
+            CacheFormat::Png,
+            false,
+            false,
+        )
+        .expect("cache build failed");
 
         assert_eq!(summary.total, 2);
         assert_eq!(summary.processed, 1);
@@ -207,6 +261,43 @@ mod tests {
         let report =
             std::fs::read_to_string(&report_path).expect("failed to read cache failure report");
         assert!(report.contains("\"sample_id\": \"broken\""));
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn writes_raw_cache_without_png_encoding() {
+        let test_root =
+            std::env::temp_dir().join(format!("localagent_raw_cache_test_{}", std::process::id()));
+        let cache_dir = test_root.join("cache");
+        let image_path = test_root.join("valid.png");
+
+        std::fs::create_dir_all(&test_root).expect("failed to create test root");
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([12, 34, 56]));
+        image.save(&image_path).expect("failed to save valid image");
+
+        let entries = vec![("valid".to_string(), image_path.display().to_string())];
+
+        let summary = build_training_cache(
+            &entries,
+            &cache_dir,
+            None,
+            8,
+            CacheFormat::Raw,
+            false,
+            false,
+        )
+        .expect("cache build failed");
+
+        assert_eq!(summary.processed, 1);
+        let output_path = cache_dir.join("valid.raw");
+        assert!(output_path.is_file());
+        assert_eq!(
+            std::fs::metadata(output_path)
+                .expect("missing raw cache")
+                .len(),
+            8 * 8 * 3
+        );
 
         let _ = std::fs::remove_dir_all(&test_root);
     }

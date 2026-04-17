@@ -3,10 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import cv2
 import polars as pl
 
-from localagent.vision import build_training_transforms, load_bgr_image
+from localagent.vision import build_training_transforms, load_rgb_image
 
 
 class ManifestImageDataset:
@@ -18,10 +17,13 @@ class ManifestImageDataset:
         label_to_index: dict[str, int],
         image_size: int = 224,
         cache_dir: Path | None = None,
+        cache_format: str = "png",
         transform: Any | None = None,
     ) -> None:
+        self.image_size = image_size
         self.label_to_index = label_to_index
         self.cache_dir = cache_dir
+        self.cache_suffix = ".raw" if cache_format == "raw" else ".png"
         self.transform = transform or build_training_transforms(image_size)
         self.cached_transform = build_training_transforms(image_size, pre_resized=True)
         self.records = list(
@@ -41,8 +43,10 @@ class ManifestImageDataset:
     def __getitem__(self, index: int):
         record = self.records[index]
         image_path, use_cached_transform = self._resolve_image_path(record)
-        image = load_bgr_image(image_path)
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        rgb_image = load_rgb_image(
+            image_path,
+            raw_image_size=self.image_size if image_path.suffix.lower() == ".raw" else None,
+        )
         transform = self.cached_transform if use_cached_transform else self.transform
         tensor = transform(rgb_image)
         label_index = self.label_to_index[str(record["label"])]
@@ -50,7 +54,7 @@ class ManifestImageDataset:
 
     def _resolve_image_path(self, record: dict[str, Any]) -> tuple[Path, bool]:
         if self.cache_dir is not None:
-            cached_path = self.cache_dir / f"{record['sample_id']}.png"
+            cached_path = self.cache_dir / f"{record['sample_id']}{self.cache_suffix}"
             if cached_path.is_file():
                 return cached_path, True
         return Path(str(record["image_path"])), False

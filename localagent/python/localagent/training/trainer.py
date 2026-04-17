@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,13 @@ from localagent.config import AgentPaths, TrainingConfig
 from localagent.data import DatasetIndex
 from localagent.training.manifest_dataset import ManifestImageDataset
 from localagent.utils import TerminalProgressBar
+
+SUPPORTED_CNN_MODELS = (
+    "mobilenet_v3_small",
+    "mobilenet_v3_large",
+    "resnet18",
+    "efficientnet_b0",
+)
 
 
 class WasteTrainer:
@@ -29,6 +37,7 @@ class WasteTrainer:
         manifest_frame: pl.DataFrame | None = None,
     ) -> dict[str, Any]:
         summary: dict[str, Any] = {
+            "training_preset": self.config.training_preset,
             "experiment_name": self.config.experiment_name,
             "model_name": self.config.model_name,
             "pretrained_backbone": self.config.pretrained_backbone,
@@ -40,11 +49,22 @@ class WasteTrainer:
             "dataset_size": len(dataset_index) if dataset_index is not None else 0,
             "artifact_dir": str(self.paths.artifact_dir),
             "manifest_path": str(self.config.manifest_path),
+            "resume_from_checkpoint": (
+                None
+                if self.config.resume_from_checkpoint is None
+                else str(self.config.resume_from_checkpoint)
+            ),
             "device": self.config.device,
             "resolved_device": self._resolve_device(),
             "rust_acceleration_available": self.rust_acceleration.is_available(),
+            "best_checkpoint_path": str(self._checkpoint_path()),
+            "latest_checkpoint_path": str(self._latest_checkpoint_path()),
             "cache_dir": str(self._cache_dir()),
+            "cache_format": self.config.cache_format,
             "cache_failure_report_path": str(self._cache_failure_report_path()),
+            "evaluation_report_path": str(self._evaluation_report_path()),
+            "confusion_matrix_path": str(self._confusion_matrix_path()),
+            "class_bias_strategy": self.config.class_bias_strategy,
             "early_stopping_patience": self.config.early_stopping_patience,
             "early_stopping_min_delta": self.config.early_stopping_min_delta,
             "enable_early_stopping": self.config.enable_early_stopping,
@@ -68,35 +88,66 @@ class WasteTrainer:
                     "num_classes": len(class_names),
                     "class_names": class_names,
                     "split_counts": split_counts,
+                    "train_label_counts": self.train_label_counts(frame),
+                    "train_imbalance_ratio": self.train_imbalance_ratio(frame),
                 }
             )
+            if self.config.class_bias_strategy != "none":
+                summary["class_weight_map"] = self.class_weight_map(frame)
         return summary
 
     def build_model_stub(self, num_classes: int = 4) -> Any:
         import torch.nn as nn
-        from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+        from torchvision.models import (
+            EfficientNet_B0_Weights,
+            MobileNet_V3_Large_Weights,
+            MobileNet_V3_Small_Weights,
+            ResNet18_Weights,
+            efficientnet_b0,
+            mobilenet_v3_large,
+            mobilenet_v3_small,
+            resnet18,
+        )
 
-        if self.config.model_name != "mobilenet_v3_small":
+        model_factories = {
+            "mobilenet_v3_small": (
+                mobilenet_v3_small,
+                MobileNet_V3_Small_Weights.DEFAULT,
+            ),
+            "mobilenet_v3_large": (
+                mobilenet_v3_large,
+                MobileNet_V3_Large_Weights.DEFAULT,
+            ),
+            "resnet18": (
+                resnet18,
+                ResNet18_Weights.DEFAULT,
+            ),
+            "efficientnet_b0": (
+                efficientnet_b0,
+                EfficientNet_B0_Weights.DEFAULT,
+            ),
+        }
+        if self.config.model_name not in model_factories:
             raise ValueError(f"Unsupported model_name: {self.config.model_name}")
 
+        factory, default_weights = model_factories[self.config.model_name]
         pretrained_loaded = False
         if self.config.pretrained_backbone:
             try:
-                model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+                model = factory(weights=default_weights)
                 pretrained_loaded = True
             except Exception as error:  # pragma: no cover - depends on local weight cache/network
                 print(
-                    "Unable to load pretrained MobileNetV3-Small weights "
+                    f"Unable to load pretrained weights for {self.config.model_name} "
                     f"({type(error).__name__}: {error}). Falling back to random init."
                 )
-                model = mobilenet_v3_small(weights=None)
+                model = factory(weights=None)
         else:
-            model = mobilenet_v3_small(weights=None)
+            model = factory(weights=None)
 
-        model.classifier[-1] = nn.Linear(int(model.classifier[-1].in_features), num_classes)
+        self._replace_classifier_head(model, num_classes=num_classes, nn_module=nn)
         if self.config.freeze_backbone:
-            for parameter in model.features.parameters():
-                parameter.requires_grad = False
+            self._freeze_model_backbone(model)
 
         self._last_model_metadata = {
             "model_name": self.config.model_name,
@@ -105,6 +156,38 @@ class WasteTrainer:
             "freeze_backbone": self.config.freeze_backbone,
         }
         return model
+
+    def _replace_classifier_head(self, model, *, num_classes: int, nn_module) -> None:
+        if self.config.model_name in {
+            "mobilenet_v3_small",
+            "mobilenet_v3_large",
+            "efficientnet_b0",
+        }:
+            model.classifier[-1] = nn_module.Linear(
+                int(model.classifier[-1].in_features),
+                num_classes,
+            )
+            return
+        if self.config.model_name == "resnet18":
+            model.fc = nn_module.Linear(int(model.fc.in_features), num_classes)
+            return
+        raise ValueError(f"Unsupported model_name: {self.config.model_name}")
+
+    def _freeze_model_backbone(self, model) -> None:
+        if self.config.model_name in {
+            "mobilenet_v3_small",
+            "mobilenet_v3_large",
+            "efficientnet_b0",
+        }:
+            for parameter in model.features.parameters():
+                parameter.requires_grad = False
+            return
+        if self.config.model_name == "resnet18":
+            for name, parameter in model.named_parameters():
+                if not name.startswith("fc."):
+                    parameter.requires_grad = False
+            return
+        raise ValueError(f"Unsupported model_name: {self.config.model_name}")
 
     def export_onnx_stub(self, output_path: Path | None = None) -> Path:
         destination = output_path or self.paths.model_dir / "waste_classifier.onnx"
@@ -130,6 +213,41 @@ class WasteTrainer:
     def build_label_index(self, manifest_frame: pl.DataFrame) -> dict[str, int]:
         return {label: index for index, label in enumerate(self.class_names(manifest_frame))}
 
+    def train_label_counts(self, manifest_frame: pl.DataFrame) -> dict[str, int]:
+        counts = {label: 0 for label in self.class_names(manifest_frame)}
+        for row in (
+            self._labeled_frame(manifest_frame)
+            .filter(pl.col("split") == "train")
+            .group_by("label")
+            .len(name="count")
+            .iter_rows(named=True)
+        ):
+            counts[str(row["label"])] = int(row["count"])
+        return counts
+
+    def train_imbalance_ratio(self, manifest_frame: pl.DataFrame) -> float:
+        counts = [count for count in self.train_label_counts(manifest_frame).values() if count > 0]
+        if not counts:
+            return 0.0
+        return max(counts) / min(counts)
+
+    def class_weight_map(self, manifest_frame: pl.DataFrame) -> dict[str, float]:
+        counts = self.train_label_counts(manifest_frame)
+        present_labels = [label for label, count in counts.items() if count > 0]
+        if not present_labels:
+            return {label: 1.0 for label in counts}
+
+        total_samples = sum(counts[label] for label in present_labels)
+        num_present_labels = len(present_labels)
+        return {
+            label: (
+                0.0
+                if counts[label] <= 0
+                else float(total_samples / (num_present_labels * counts[label]))
+            )
+            for label in counts
+        }
+
     def build_datasets(
         self,
         manifest_path: Path | None = None,
@@ -145,6 +263,7 @@ class WasteTrainer:
                 label_to_index=label_to_index,
                 image_size=self.config.image_size,
                 cache_dir=cache_dir,
+                cache_format=self.config.cache_format,
             )
             for split in ("train", "val", "test")
         }
@@ -158,10 +277,18 @@ class WasteTrainer:
     ):
         from torch.utils.data import DataLoader
 
+        frame = manifest_frame if manifest_frame is not None else self.load_manifest(manifest_path)
         datasets, label_to_index = self.build_datasets(
-            manifest_path,
-            manifest_frame,
+            manifest_frame=frame,
             cache_dir=cache_dir,
+        )
+        train_sampler = (
+            self._build_train_sampler(
+                datasets["train"],
+                weight_map=self.class_weight_map(frame),
+            )
+            if "train" in datasets
+            else None
         )
         resolved_device = self._resolve_device()
         loader_kwargs: dict[str, Any] = {
@@ -172,15 +299,17 @@ class WasteTrainer:
         }
         if self.config.num_workers > 0:
             loader_kwargs["prefetch_factor"] = self.config.prefetch_factor
-        loaders = {
-            split: DataLoader(
-                dataset,
-                shuffle=(split == "train"),
-                **loader_kwargs,
-            )
-            for split, dataset in datasets.items()
-            if len(dataset) > 0
-        }
+        loaders = {}
+        for split, dataset in datasets.items():
+            if len(dataset) == 0:
+                continue
+
+            split_kwargs = dict(loader_kwargs)
+            shuffle = split == "train"
+            if split == "train" and train_sampler is not None:
+                split_kwargs["sampler"] = train_sampler
+                shuffle = False
+            loaders[split] = DataLoader(dataset, shuffle=shuffle, **split_kwargs)
         return loaders, label_to_index
 
     def export_label_index(
@@ -195,6 +324,257 @@ class WasteTrainer:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(labels, indent=2), encoding="utf-8")
         return destination
+
+    def _compute_best_loss_from_history(self, history: list[dict[str, Any]]) -> float:
+        best_loss = float("inf")
+        for epoch_summary in history:
+            metric_source = epoch_summary.get("val_loss", epoch_summary.get("train_loss"))
+            if metric_source is None:
+                continue
+            best_loss = min(best_loss, float(metric_source))
+        return best_loss
+
+    def _load_resume_state(
+        self,
+        *,
+        checkpoint_path: Path,
+        model,
+        optimizer,
+        class_names: list[str],
+        device: str,
+    ) -> dict[str, Any]:
+        import torch
+
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {checkpoint_path}")
+
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid checkpoint payload: {checkpoint_path}")
+
+        checkpoint_labels = payload.get("labels")
+        if checkpoint_labels is not None and list(checkpoint_labels) != class_names:
+            raise ValueError(
+                "Checkpoint labels do not match the current manifest labels. "
+                f"{checkpoint_path}"
+            )
+
+        model_state_dict = payload.get("model_state_dict") or payload.get("best_model_state_dict")
+        if model_state_dict is None:
+            raise ValueError(f"Checkpoint has no model_state_dict: {checkpoint_path}")
+        model.load_state_dict(model_state_dict)
+
+        optimizer_state_dict = payload.get("optimizer_state_dict")
+        if optimizer_state_dict is not None:
+            optimizer.load_state_dict(optimizer_state_dict)
+            self._move_optimizer_state_to_device(optimizer, device=device)
+
+        history_raw = payload.get("history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        best_state_dict = payload.get("best_model_state_dict")
+        if best_state_dict is None:
+            best_state_dict = copy.deepcopy(model_state_dict)
+
+        best_loss_raw = payload.get("best_loss")
+        best_loss = (
+            float(best_loss_raw)
+            if best_loss_raw is not None
+            else self._compute_best_loss_from_history(history)
+        )
+        if best_loss == float("inf"):
+            best_loss = float("inf")
+
+        last_completed_epoch_raw = payload.get("last_completed_epoch", len(history))
+        last_completed_epoch = int(last_completed_epoch_raw)
+        best_epoch = int(payload.get("best_epoch", 0))
+        print(
+            "Resuming training from "
+            f"{checkpoint_path} starting at epoch {last_completed_epoch + 1}."
+        )
+        return {
+            "history": history,
+            "best_epoch": best_epoch,
+            "best_loss": best_loss,
+            "best_model_state_dict": best_state_dict,
+            "last_completed_epoch": last_completed_epoch,
+        }
+
+    def _move_optimizer_state_to_device(self, optimizer, *, device: str) -> None:
+        import torch
+
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device)
+
+    def _checkpoint_payload(
+        self,
+        *,
+        model_state_dict: dict[str, Any],
+        optimizer_state_dict: dict[str, Any] | None,
+        labels: list[str],
+        history: list[dict[str, Any]],
+        best_epoch: int,
+        best_loss: float,
+        best_model_state_dict: dict[str, Any],
+        last_completed_epoch: int,
+        target_epochs: int,
+        checkpoint_kind: str,
+        interrupted: bool,
+        stopped_early: bool,
+        stop_reason: str | None,
+        evaluation_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": optimizer_state_dict,
+            "best_model_state_dict": best_model_state_dict,
+            "labels": labels,
+            "history": history,
+            "experiment_name": self.config.experiment_name,
+            "training_preset": self.config.training_preset,
+            "best_epoch": best_epoch,
+            "best_loss": best_loss,
+            "last_completed_epoch": last_completed_epoch,
+            "target_epochs": target_epochs,
+            "checkpoint_kind": checkpoint_kind,
+            "resume_from_checkpoint": (
+                None
+                if self.config.resume_from_checkpoint is None
+                else str(self.config.resume_from_checkpoint)
+            ),
+            "model": self._last_model_metadata,
+            "cache_format": self.config.cache_format,
+            "class_bias_strategy": self.config.class_bias_strategy,
+            "stopped_early": stopped_early,
+            "interrupted": interrupted,
+            "stop_reason": stop_reason,
+            "evaluation_summary": evaluation_summary,
+        }
+
+    def _save_training_checkpoint(
+        self,
+        *,
+        checkpoint_path: Path,
+        model_state_dict: dict[str, Any],
+        optimizer_state_dict: dict[str, Any] | None,
+        labels: list[str],
+        history: list[dict[str, Any]],
+        best_epoch: int,
+        best_loss: float,
+        best_model_state_dict: dict[str, Any],
+        last_completed_epoch: int,
+        target_epochs: int,
+        checkpoint_kind: str,
+        interrupted: bool,
+        stopped_early: bool,
+        stop_reason: str | None,
+        evaluation_summary: dict[str, Any] | None = None,
+    ) -> Path:
+        import torch
+
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            self._checkpoint_payload(
+                model_state_dict=model_state_dict,
+                optimizer_state_dict=optimizer_state_dict,
+                labels=labels,
+                history=history,
+                best_epoch=best_epoch,
+                best_loss=best_loss,
+                best_model_state_dict=best_model_state_dict,
+                last_completed_epoch=last_completed_epoch,
+                target_epochs=target_epochs,
+                checkpoint_kind=checkpoint_kind,
+                interrupted=interrupted,
+                stopped_early=stopped_early,
+                stop_reason=stop_reason,
+                evaluation_summary=evaluation_summary,
+            ),
+            checkpoint_path,
+        )
+        return checkpoint_path
+
+    def _build_classification_report(
+        self,
+        *,
+        predictions: list[int],
+        targets: list[int],
+        class_names: list[str],
+    ) -> dict[str, Any]:
+        num_classes = len(class_names)
+        confusion_matrix = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
+        for target, prediction in zip(targets, predictions, strict=False):
+            if 0 <= int(target) < num_classes and 0 <= int(prediction) < num_classes:
+                confusion_matrix[int(target)][int(prediction)] += 1
+
+        per_class: dict[str, dict[str, float | int]] = {}
+        macro_precision = 0.0
+        macro_recall = 0.0
+        macro_f1 = 0.0
+        weighted_f1 = 0.0
+        total_support = 0
+        total_correct = 0
+
+        for class_index, label in enumerate(class_names):
+            tp = int(confusion_matrix[class_index][class_index])
+            support = int(sum(confusion_matrix[class_index]))
+            predicted_count = int(sum(row[class_index] for row in confusion_matrix))
+            fp = predicted_count - tp
+            fn = support - tp
+            precision = (tp / predicted_count) if predicted_count > 0 else 0.0
+            recall = (tp / support) if support > 0 else 0.0
+            f1 = (
+                (2.0 * precision * recall / (precision + recall))
+                if (precision + recall) > 0.0
+                else 0.0
+            )
+            per_class[label] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": support,
+                "true_positives": tp,
+                "false_positives": fp,
+                "false_negatives": fn,
+            }
+            macro_precision += precision
+            macro_recall += recall
+            macro_f1 += f1
+            weighted_f1 += f1 * support
+            total_support += support
+            total_correct += tp
+
+        divisor = max(num_classes, 1)
+        return {
+            "labels": class_names,
+            "num_samples": total_support,
+            "accuracy": (total_correct / total_support) if total_support > 0 else 0.0,
+            "macro_precision": macro_precision / divisor,
+            "macro_recall": macro_recall / divisor,
+            "macro_f1": macro_f1 / divisor,
+            "weighted_f1": (weighted_f1 / total_support) if total_support > 0 else 0.0,
+            "per_class": per_class,
+            "confusion_matrix": confusion_matrix,
+        }
+
+    def _write_evaluation_artifacts(self, evaluation: dict[str, Any]) -> tuple[Path, Path]:
+        report_path = self._evaluation_report_path()
+        confusion_path = self._confusion_matrix_path()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(evaluation, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        labels = list(evaluation.get("labels", []))
+        matrix = list(evaluation.get("confusion_matrix", []))
+        with confusion_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["label", *labels])
+            for label, row in zip(labels, matrix, strict=False):
+                writer.writerow([label, *row])
+        return report_path, confusion_path
 
     def fit(
         self,
@@ -212,12 +592,15 @@ class WasteTrainer:
         if not label_to_index:
             raise RuntimeError("No labels available in manifest. Cannot train a classifier.")
 
+        class_names = self.class_names(frame)
         model = self.build_model_stub(num_classes=len(label_to_index))
         device = self._resolve_device()
         print(f"Training on device: {device}")
         model.to(device)
 
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(
+            weight=self._loss_class_weights(frame, label_to_index, device=device)
+        )
         optimizer = torch.optim.Adam(
             [parameter for parameter in model.parameters() if parameter.requires_grad],
             lr=self.config.learning_rate,
@@ -228,100 +611,196 @@ class WasteTrainer:
         best_epoch = 0
         best_loss = float("inf")
         best_state_dict = copy.deepcopy(model.state_dict())
+        last_completed_epoch = 0
         epochs_without_improvement = 0
         stopped_early = False
+        interrupted = False
         stop_reason: str | None = None
+        evaluation_summary: dict[str, Any] | None = None
+        best_checkpoint_path = self._checkpoint_path()
+        latest_checkpoint_path = self._latest_checkpoint_path()
 
-        for epoch in range(1, self.config.epochs + 1):
-            train_metrics = self._run_epoch(
+        if self.config.resume_from_checkpoint is not None:
+            resume_state = self._load_resume_state(
+                checkpoint_path=self.config.resume_from_checkpoint,
                 model=model,
-                loader=loaders["train"],
-                criterion=criterion,
                 optimizer=optimizer,
+                class_names=class_names,
                 device=device,
-                training=True,
-                stage_name=f"train {epoch}/{self.config.epochs}",
+            )
+            history = resume_state["history"]
+            best_epoch = int(resume_state["best_epoch"])
+            best_loss = float(resume_state["best_loss"])
+            best_state_dict = copy.deepcopy(resume_state["best_model_state_dict"])
+            last_completed_epoch = int(resume_state["last_completed_epoch"])
+            if self.config.epochs <= last_completed_epoch:
+                raise ValueError(
+                    "Requested epochs must be greater than the completed epochs in the "
+                    f"resume checkpoint ({last_completed_epoch})."
+                )
+
+        if not self.config.show_progress:
+            print(
+                "Progress bars disabled; reporting text progress snapshots "
+                "during training and epoch summaries."
             )
 
-            val_metrics = (
-                self._run_epoch(
+        try:
+            for epoch in range(last_completed_epoch + 1, self.config.epochs + 1):
+                train_metrics = self._run_epoch(
                     model=model,
-                    loader=loaders["val"],
+                    loader=loaders["train"],
                     criterion=criterion,
-                    optimizer=None,
+                    optimizer=optimizer,
                     device=device,
-                    training=False,
-                    stage_name=f"val {epoch}/{self.config.epochs}",
+                    training=True,
+                    stage_name=f"train {epoch}/{self.config.epochs}",
                 )
-                if "val" in loaders
-                else None
+
+                val_metrics = (
+                    self._run_epoch(
+                        model=model,
+                        loader=loaders["val"],
+                        criterion=criterion,
+                        optimizer=None,
+                        device=device,
+                        training=False,
+                        stage_name=f"val {epoch}/{self.config.epochs}",
+                    )
+                    if "val" in loaders
+                    else None
+                )
+
+                metric_source = val_metrics or train_metrics
+                current_loss = float(metric_source["loss"])
+                if current_loss < best_loss - self.config.early_stopping_min_delta:
+                    best_loss = current_loss
+                    best_epoch = epoch
+                    best_state_dict = copy.deepcopy(model.state_dict())
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                epoch_summary: dict[str, float | int] = {
+                    "epoch": epoch,
+                    "train_loss": float(train_metrics["loss"]),
+                    "train_accuracy": float(train_metrics["accuracy"]),
+                }
+                if val_metrics is not None:
+                    epoch_summary.update(
+                        {
+                            "val_loss": float(val_metrics["loss"]),
+                            "val_accuracy": float(val_metrics["accuracy"]),
+                        }
+                    )
+                history.append(epoch_summary)
+                last_completed_epoch = epoch
+                self._save_training_checkpoint(
+                    checkpoint_path=latest_checkpoint_path,
+                    model_state_dict=copy.deepcopy(model.state_dict()),
+                    optimizer_state_dict=copy.deepcopy(optimizer.state_dict()),
+                    labels=class_names,
+                    history=history,
+                    best_epoch=best_epoch,
+                    best_loss=best_loss,
+                    best_model_state_dict=copy.deepcopy(best_state_dict),
+                    last_completed_epoch=last_completed_epoch,
+                    target_epochs=self.config.epochs,
+                    checkpoint_kind="last",
+                    interrupted=False,
+                    stopped_early=False,
+                    stop_reason=None,
+                )
+                if best_epoch == epoch:
+                    self._save_training_checkpoint(
+                        checkpoint_path=best_checkpoint_path,
+                        model_state_dict=copy.deepcopy(best_state_dict),
+                        optimizer_state_dict=copy.deepcopy(optimizer.state_dict()),
+                        labels=class_names,
+                        history=history,
+                        best_epoch=best_epoch,
+                        best_loss=best_loss,
+                        best_model_state_dict=copy.deepcopy(best_state_dict),
+                        last_completed_epoch=last_completed_epoch,
+                        target_epochs=self.config.epochs,
+                        checkpoint_kind="best",
+                        interrupted=False,
+                        stopped_early=False,
+                        stop_reason=None,
+                    )
+
+                self._print_epoch_summary(
+                    epoch_summary,
+                    best_epoch=best_epoch,
+                    best_loss=best_loss,
+                )
+
+                if self._should_stop_early(epochs_without_improvement):
+                    stopped_early = True
+                    stop_reason = (
+                        "Early stopping triggered after "
+                        f"{epochs_without_improvement} epoch(s) without improvement "
+                        f"greater than {self.config.early_stopping_min_delta}."
+                    )
+                    print(stop_reason)
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            stop_reason = (
+                "Training interrupted by user. "
+                f"Saved latest checkpoint to {latest_checkpoint_path}."
+            )
+            print(stop_reason)
+            self._save_training_checkpoint(
+                checkpoint_path=latest_checkpoint_path,
+                model_state_dict=copy.deepcopy(model.state_dict()),
+                optimizer_state_dict=copy.deepcopy(optimizer.state_dict()),
+                labels=class_names,
+                history=history,
+                best_epoch=best_epoch,
+                best_loss=best_loss,
+                best_model_state_dict=copy.deepcopy(best_state_dict),
+                last_completed_epoch=last_completed_epoch,
+                target_epochs=self.config.epochs,
+                checkpoint_kind="last",
+                interrupted=True,
+                stopped_early=False,
+                stop_reason=stop_reason,
             )
 
-            metric_source = val_metrics or train_metrics
-            current_loss = float(metric_source["loss"])
-            if current_loss < best_loss - self.config.early_stopping_min_delta:
-                best_loss = current_loss
-                best_epoch = epoch
-                best_state_dict = copy.deepcopy(model.state_dict())
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-
-            epoch_summary: dict[str, float | int] = {
-                "epoch": epoch,
-                "train_loss": float(train_metrics["loss"]),
-                "train_accuracy": float(train_metrics["accuracy"]),
-            }
-            if val_metrics is not None:
-                epoch_summary.update(
-                    {
-                        "val_loss": float(val_metrics["loss"]),
-                        "val_accuracy": float(val_metrics["accuracy"]),
-                    }
-                )
-            history.append(epoch_summary)
-
-            if self._should_stop_early(epochs_without_improvement):
-                stopped_early = True
-                stop_reason = (
-                    "Early stopping triggered after "
-                    f"{epochs_without_improvement} epoch(s) without improvement "
-                    f"greater than {self.config.early_stopping_min_delta}."
-                )
-                print(stop_reason)
-                break
-
-        model.load_state_dict(best_state_dict)
-        checkpoint_path = self._checkpoint_path()
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "labels": self.class_names(frame),
-                "history": history,
-                "experiment_name": self.config.experiment_name,
-                "best_epoch": best_epoch,
-                "model": self._last_model_metadata,
-                "stopped_early": stopped_early,
-                "stop_reason": stop_reason,
-            },
-            checkpoint_path,
-        )
         labels_path = self.export_label_index(manifest_frame=frame)
 
         summary = {
-            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_path": str(best_checkpoint_path),
+            "best_checkpoint_path": str(best_checkpoint_path),
+            "latest_checkpoint_path": str(latest_checkpoint_path),
+            "training_preset": self.config.training_preset,
             "labels_path": str(labels_path),
             "num_classes": len(label_to_index),
             "best_epoch": best_epoch,
+            "best_loss": best_loss,
             "epochs_completed": len(history),
             "stopped_early": stopped_early,
+            "interrupted": interrupted,
             "stop_reason": stop_reason,
             "history": history,
             "device": device,
             "model": self._last_model_metadata,
+            "resume_from_checkpoint": (
+                None
+                if self.config.resume_from_checkpoint is None
+                else str(self.config.resume_from_checkpoint)
+            ),
+            "cache_format": self.config.cache_format,
+            "class_bias_strategy": self.config.class_bias_strategy,
+            "class_weight_map": self.class_weight_map(frame),
             "cache": cache_summary,
         }
+
+        if interrupted:
+            return summary
+
+        model.load_state_dict(best_state_dict)
 
         if "test" in loaders:
             test_metrics = self._run_epoch(
@@ -332,9 +811,45 @@ class WasteTrainer:
                 device=device,
                 training=False,
                 stage_name="test",
+                collect_predictions=True,
             )
             summary["test_loss"] = float(test_metrics["loss"])
             summary["test_accuracy"] = float(test_metrics["accuracy"])
+            predictions = test_metrics.get("predictions")
+            targets = test_metrics.get("targets")
+            if isinstance(predictions, list) and isinstance(targets, list):
+                evaluation = self._build_classification_report(
+                    predictions=predictions,
+                    targets=targets,
+                    class_names=class_names,
+                )
+                report_path, confusion_path = self._write_evaluation_artifacts(evaluation)
+                evaluation_summary = {
+                    "accuracy": float(evaluation["accuracy"]),
+                    "macro_f1": float(evaluation["macro_f1"]),
+                    "weighted_f1": float(evaluation["weighted_f1"]),
+                }
+                summary["evaluation_report_path"] = str(report_path)
+                summary["confusion_matrix_path"] = str(confusion_path)
+                summary["evaluation_summary"] = evaluation_summary
+
+        self._save_training_checkpoint(
+            checkpoint_path=best_checkpoint_path,
+            model_state_dict=copy.deepcopy(best_state_dict),
+            optimizer_state_dict=copy.deepcopy(optimizer.state_dict()),
+            labels=class_names,
+            history=history,
+            best_epoch=best_epoch,
+            best_loss=best_loss,
+            best_model_state_dict=copy.deepcopy(best_state_dict),
+            last_completed_epoch=last_completed_epoch,
+            target_epochs=self.config.epochs,
+            checkpoint_kind="best",
+            interrupted=False,
+            stopped_early=stopped_early,
+            stop_reason=stop_reason,
+            evaluation_summary=evaluation_summary,
+        )
 
         return summary
 
@@ -363,6 +878,7 @@ class WasteTrainer:
             cache_dir=cache_dir,
             failure_report_path=failure_report_path,
             image_size=self.config.image_size,
+            cache_format=self.config.cache_format,
             force=self.config.force_rebuild_cache,
             show_progress=self.config.show_progress,
         )
@@ -399,14 +915,33 @@ class WasteTrainer:
     def _checkpoint_path(self) -> Path:
         return self.config.checkpoint_dir / f"{self.config.experiment_name}.pt"
 
-    def _cache_dir(self) -> Path:
-        return self.config.cache_dir / f"{self.config.image_size}px"
+    def _latest_checkpoint_path(self) -> Path:
+        return self.config.checkpoint_dir / f"{self.config.experiment_name}.last.pt"
 
-    def _cache_failure_report_path(self) -> Path:
+    def _evaluation_report_path(self) -> Path:
         return (
             self.paths.artifact_dir
             / "reports"
-            / f"training_cache_failures_{self.config.image_size}px.json"
+            / f"{self.config.experiment_name}_evaluation.json"
+        )
+
+    def _confusion_matrix_path(self) -> Path:
+        return (
+            self.paths.artifact_dir
+            / "reports"
+            / f"{self.config.experiment_name}_confusion_matrix.csv"
+        )
+
+    def _cache_dir(self) -> Path:
+        suffix = "" if self.config.cache_format == "png" else f"-{self.config.cache_format}"
+        return self.config.cache_dir / f"{self.config.image_size}px{suffix}"
+
+    def _cache_failure_report_path(self) -> Path:
+        suffix = "" if self.config.cache_format == "png" else f"_{self.config.cache_format}"
+        return (
+            self.paths.artifact_dir
+            / "reports"
+            / f"training_cache_failures_{self.config.image_size}px{suffix}.json"
         )
 
     def _cache_entries(self, manifest_frame: pl.DataFrame) -> list[tuple[str, str]]:
@@ -449,7 +984,7 @@ class WasteTrainer:
         for index, record in enumerate(failures, start=1):
             if self._write_cache_with_opencv(
                 image_path=Path(str(record["image_path"])),
-                output_path=cache_dir / f"{record['sample_id']}.png",
+                output_path=cache_dir / f"{record['sample_id']}{self._cache_file_suffix()}",
             ):
                 recovered += 1
             else:
@@ -484,15 +1019,61 @@ class WasteTrainer:
                 (self.config.image_size, self.config.image_size),
                 interpolation=cv2.INTER_AREA,
             )
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.config.cache_format == "raw":
+                cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).tofile(output_path)
+                return True
+
             success, buffer = cv2.imencode(".png", resized)
             if not success:
                 return False
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
             buffer.tofile(output_path)
             return True
         except Exception:
             return False
+
+    def _cache_file_suffix(self) -> str:
+        return ".raw" if self.config.cache_format == "raw" else ".png"
+
+    def _build_train_sampler(
+        self,
+        dataset: ManifestImageDataset,
+        *,
+        weight_map: dict[str, float],
+    ):
+        if self.config.class_bias_strategy not in {"sampler", "both"}:
+            return None
+
+        import torch
+        from torch.utils.data import WeightedRandomSampler
+
+        sample_weights = [float(weight_map[str(record["label"])]) for record in dataset.records]
+        if not sample_weights:
+            return None
+        return WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+
+    def _loss_class_weights(
+        self,
+        manifest_frame: pl.DataFrame,
+        label_to_index: dict[str, int],
+        *,
+        device: str,
+    ):
+        if self.config.class_bias_strategy not in {"loss", "both"}:
+            return None
+
+        import torch
+
+        weight_map = self.class_weight_map(manifest_frame)
+        weights = torch.ones(len(label_to_index), dtype=torch.float32, device=device)
+        for label, index in label_to_index.items():
+            weights[index] = float(weight_map.get(label, 1.0))
+        return weights
 
     def _run_epoch(
         self,
@@ -504,7 +1085,8 @@ class WasteTrainer:
         device: str,
         training: bool,
         stage_name: str,
-    ) -> dict[str, float]:
+        collect_predictions: bool = False,
+    ) -> dict[str, Any]:
         import torch
 
         if training:
@@ -515,6 +1097,8 @@ class WasteTrainer:
         total_loss = 0.0
         total_correct = 0
         total_examples = 0
+        predictions: list[int] = []
+        targets: list[int] = []
 
         context = torch.enable_grad() if training else torch.inference_mode()
         progress = TerminalProgressBar(
@@ -522,6 +1106,7 @@ class WasteTrainer:
             description=stage_name,
             enabled=self.config.show_progress,
         )
+        log_interval = self._batch_log_interval(len(loader))
         with context:
             for batch_index, (images, labels) in enumerate(loader, start=1):
                 images = images.to(device)
@@ -532,14 +1117,18 @@ class WasteTrainer:
 
                 logits = model(images)
                 loss = criterion(logits, labels)
+                predicted = logits.argmax(dim=1)
 
                 if training and optimizer is not None:
                     loss.backward()
                     optimizer.step()
 
                 total_loss += float(loss.item()) * int(labels.size(0))
-                total_correct += int((logits.argmax(dim=1) == labels).sum().item())
+                total_correct += int((predicted == labels).sum().item())
                 total_examples += int(labels.size(0))
+                if collect_predictions:
+                    predictions.extend(predicted.detach().cpu().tolist())
+                    targets.extend(labels.detach().cpu().tolist())
 
                 running_loss = total_loss / max(total_examples, 1)
                 running_accuracy = total_correct / max(total_examples, 1)
@@ -547,6 +1136,18 @@ class WasteTrainer:
                     batch_index,
                     postfix=f"loss={running_loss:.4f} acc={running_accuracy:.3f}",
                 )
+                if self._should_log_batch_snapshot(
+                    batch_index=batch_index,
+                    total_batches=len(loader),
+                    log_interval=log_interval,
+                ):
+                    self._print_batch_snapshot(
+                        stage_name=stage_name,
+                        batch_index=batch_index,
+                        total_batches=len(loader),
+                        loss=running_loss,
+                        accuracy=running_accuracy,
+                    )
 
         if total_examples == 0:
             progress.close(summary=f"{stage_name}: no samples")
@@ -556,6 +1157,9 @@ class WasteTrainer:
             "loss": total_loss / total_examples,
             "accuracy": total_correct / total_examples,
         }
+        if collect_predictions:
+            metrics["predictions"] = predictions
+            metrics["targets"] = targets
         progress.close(
             summary=(
                 f"{stage_name}: loss={metrics['loss']:.4f} "
@@ -563,6 +1167,69 @@ class WasteTrainer:
             )
         )
         return metrics
+
+    def _print_epoch_summary(
+        self,
+        epoch_summary: dict[str, float | int],
+        *,
+        best_epoch: int,
+        best_loss: float,
+    ) -> None:
+        if self.config.show_progress:
+            return
+
+        epoch = int(epoch_summary["epoch"])
+        progress_pct = (epoch / max(self.config.epochs, 1)) * 100.0
+        parts = [
+            f"epoch {epoch}/{self.config.epochs}",
+            f"{progress_pct:.2f}%",
+            f"train_loss={float(epoch_summary['train_loss']):.4f}",
+            f"train_acc={float(epoch_summary['train_accuracy']):.3f}",
+        ]
+        if "val_loss" in epoch_summary:
+            parts.append(f"val_loss={float(epoch_summary['val_loss']):.4f}")
+        if "val_accuracy" in epoch_summary:
+            parts.append(f"val_acc={float(epoch_summary['val_accuracy']):.3f}")
+        parts.append(f"best_epoch={best_epoch}")
+        parts.append(f"best_loss={best_loss:.4f}")
+        print(" | ".join(parts))
+
+    def _batch_log_interval(self, total_batches: int) -> int:
+        if total_batches <= 0:
+            return 1
+        return max(1, total_batches // 10)
+
+    def _should_log_batch_snapshot(
+        self,
+        *,
+        batch_index: int,
+        total_batches: int,
+        log_interval: int,
+    ) -> bool:
+        if self.config.show_progress or total_batches <= 0:
+            return False
+        return (
+            batch_index == 1
+            or batch_index == total_batches
+            or batch_index % max(log_interval, 1) == 0
+        )
+
+    def _print_batch_snapshot(
+        self,
+        *,
+        stage_name: str,
+        batch_index: int,
+        total_batches: int,
+        loss: float,
+        accuracy: float,
+    ) -> None:
+        if self.config.show_progress:
+            return
+        progress_pct = (batch_index / max(total_batches, 1)) * 100.0
+        print(
+            f"{stage_name} | batch {batch_index}/{total_batches} | "
+            f"{progress_pct:.2f}% | loss={loss:.4f} acc={accuracy:.3f}"
+        )
 
     def _should_stop_early(self, epochs_without_improvement: int) -> bool:
         if not self.config.enable_early_stopping:

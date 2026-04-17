@@ -49,6 +49,7 @@ class RuntimeConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
+    training_preset: str | None = None
     experiment_name: str = "baseline-waste-sorter"
     model_name: str = "mobilenet_v3_small"
     pretrained_backbone: bool = True
@@ -72,11 +73,14 @@ class TrainingConfig:
     checkpoint_dir: Path = field(
         default_factory=lambda: _project_root() / "artifacts" / "checkpoints"
     )
+    resume_from_checkpoint: Path | None = None
     cache_dir: Path = field(
         default_factory=lambda: _project_root() / "artifacts" / "cache" / "training"
     )
+    cache_format: str = "png"
     use_rust_image_cache: bool = True
     force_rebuild_cache: bool = False
+    class_bias_strategy: str = "none"
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 1e-3
     enable_early_stopping: bool = True

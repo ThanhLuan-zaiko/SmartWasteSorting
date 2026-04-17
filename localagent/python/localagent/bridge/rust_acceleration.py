@@ -20,6 +20,7 @@ class RustAccelerationBridge:
         cache_dir: Path,
         failure_report_path: Path | None = None,
         image_size: int,
+        cache_format: str = "png",
         force: bool = False,
         show_progress: bool = True,
     ) -> dict[str, Any] | None:
@@ -34,6 +35,7 @@ class RustAccelerationBridge:
                 None if failure_report_path is None else str(failure_report_path)
             ),
             image_size=int(image_size),
+            cache_format=str(cache_format),
             force=bool(force),
             show_progress=bool(show_progress),
         )

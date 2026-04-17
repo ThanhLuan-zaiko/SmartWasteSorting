@@ -1,6 +1,9 @@
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyModule, wrap_pyfunction, Bound};
 
-use crate::{training_cache::build_training_cache, RuntimeConfig, WasteClassifier};
+use crate::{
+    training_cache::{build_training_cache, CacheFormat},
+    RuntimeConfig, WasteClassifier,
+};
 
 #[pyclass]
 pub struct RustBackend {
@@ -56,22 +59,26 @@ fn ping() -> &'static str {
 }
 
 #[pyfunction]
-#[pyo3(signature = (entries, cache_dir, image_size, failure_report_path=None, force=false, show_progress=true))]
+#[pyo3(signature = (entries, cache_dir, image_size, cache_format="png", failure_report_path=None, force=false, show_progress=true))]
 fn prepare_image_cache(
     py: Python<'_>,
     entries: Vec<(String, String)>,
     cache_dir: String,
     image_size: u32,
+    cache_format: &str,
     failure_report_path: Option<String>,
     force: bool,
     show_progress: bool,
 ) -> PyResult<String> {
     py.allow_threads(move || {
+        let cache_format = CacheFormat::parse(cache_format)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let summary = build_training_cache(
             &entries,
             std::path::Path::new(&cache_dir),
             failure_report_path.as_deref().map(std::path::Path::new),
             image_size,
+            cache_format,
             force,
             show_progress,
         )
