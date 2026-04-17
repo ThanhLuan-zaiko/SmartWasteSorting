@@ -1,6 +1,7 @@
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyModule, wrap_pyfunction, Bound};
 
 use crate::{
+    build_classification_report, compute_class_weight_map,
     training_cache::{build_training_cache, CacheFormat},
     RuntimeConfig, WasteClassifier,
 };
@@ -59,6 +60,26 @@ fn ping() -> &'static str {
 }
 
 #[pyfunction]
+fn compute_class_weight_map_json(
+    train_labels: Vec<String>,
+    class_names: Vec<String>,
+) -> PyResult<String> {
+    let weights = compute_class_weight_map(&train_labels, &class_names);
+    serde_json::to_string(&weights).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+#[pyfunction]
+fn build_classification_report_json(
+    predictions: Vec<usize>,
+    targets: Vec<usize>,
+    class_names: Vec<String>,
+) -> PyResult<String> {
+    let report = build_classification_report(&predictions, &targets, &class_names)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    serde_json::to_string(&report).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+#[pyfunction]
 #[pyo3(signature = (entries, cache_dir, image_size, cache_format="png", failure_report_path=None, force=false, show_progress=true))]
 fn prepare_image_cache(
     py: Python<'_>,
@@ -91,6 +112,8 @@ fn prepare_image_cache(
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RustBackend>()?;
     module.add_function(wrap_pyfunction!(ping, module)?)?;
+    module.add_function(wrap_pyfunction!(compute_class_weight_map_json, module)?)?;
+    module.add_function(wrap_pyfunction!(build_classification_report_json, module)?)?;
     module.add_function(wrap_pyfunction!(prepare_image_cache, module)?)?;
     Ok(())
 }

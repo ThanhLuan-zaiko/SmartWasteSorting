@@ -684,6 +684,208 @@ def test_fit_writes_evaluation_report_and_confusion_matrix(tmp_path: Path) -> No
     assert report_payload["confusion_matrix"][0][1] == 1
 
 
+def test_evaluate_uses_saved_checkpoint_and_writes_report(tmp_path: Path) -> None:
+    pipeline_config = _build_two_class_manifest(
+        tmp_path / "evaluate_run",
+        per_class=4,
+        random_seed=37,
+    )
+
+    training_config = TrainingConfig(
+        epochs=1,
+        batch_size=2,
+        num_workers=0,
+        pretrained_backbone=False,
+        image_size=8,
+        manifest_path=pipeline_config.manifest_path,
+        checkpoint_dir=tmp_path / "artifacts" / "checkpoints",
+        show_progress=False,
+    )
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        training_config,
+    )
+
+    trainer.warm_image_cache = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    trainer.build_dataloaders = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        {"test": [0]},
+        {"glass": 0, "plastic": 1},
+    )
+
+    def fake_build_model(num_classes: int = 4):
+        trainer._last_model_metadata = {
+            "model_name": "mobilenet_v3_small",
+            "pretrained_backbone_requested": False,
+            "pretrained_backbone_loaded": False,
+            "freeze_backbone": True,
+            "image_size": training_config.image_size,
+            "normalization_preset": training_config.normalization_preset,
+        }
+        return torch.nn.Linear(4, num_classes)
+
+    trainer.build_model_stub = fake_build_model  # type: ignore[method-assign]
+    model = fake_build_model(num_classes=2)
+    trainer._save_training_checkpoint(
+        checkpoint_path=trainer._checkpoint_path(),
+        model_state_dict=model.state_dict(),
+        optimizer_state_dict=None,
+        labels=["glass", "plastic"],
+        history=[],
+        best_epoch=1,
+        best_loss=0.5,
+        best_model_state_dict=model.state_dict(),
+        last_completed_epoch=1,
+        target_epochs=1,
+        checkpoint_kind="best",
+        interrupted=False,
+        stopped_early=False,
+        stop_reason=None,
+    )
+    trainer._run_epoch = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "loss": 0.25,
+        "accuracy": 0.75,
+        "predictions": [0, 1, 1, 1],
+        "targets": [0, 1, 0, 1],
+    }
+
+    summary = trainer.evaluate()
+    report_path = Path(str(summary["evaluation_report_path"]))
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report_path.is_file()
+    assert summary["accuracy"] == 0.75
+    assert summary["split"] == "test"
+    assert report_payload["loss"] == 0.25
+    assert report_payload["confusion_matrix"][0][1] == 1
+
+
+def test_export_onnx_writes_manifest_and_export_report(tmp_path: Path) -> None:
+    pipeline_config = _build_two_class_manifest(
+        tmp_path / "export_run",
+        per_class=4,
+        random_seed=41,
+    )
+
+    training_config = TrainingConfig(
+        epochs=1,
+        batch_size=2,
+        num_workers=0,
+        pretrained_backbone=False,
+        image_size=8,
+        manifest_path=pipeline_config.manifest_path,
+        labels_output_path=tmp_path / "models" / "labels.json",
+        onnx_output_path=tmp_path / "models" / "waste_classifier.onnx",
+        model_manifest_output_path=tmp_path / "models" / "model_manifest.json",
+        checkpoint_dir=tmp_path / "artifacts" / "checkpoints",
+        show_progress=False,
+    )
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        training_config,
+    )
+
+    def fake_build_model(num_classes: int = 4):
+        trainer._last_model_metadata = {
+            "model_name": "linear_export_stub",
+            "pretrained_backbone_requested": False,
+            "pretrained_backbone_loaded": False,
+            "freeze_backbone": True,
+            "image_size": training_config.image_size,
+            "normalization_preset": training_config.normalization_preset,
+        }
+        return torch.nn.Sequential(
+            torch.nn.Flatten(),
+            torch.nn.Linear(
+                3 * training_config.image_size * training_config.image_size,
+                num_classes,
+            ),
+        )
+
+    trainer.build_model_stub = fake_build_model  # type: ignore[method-assign]
+    model = fake_build_model(num_classes=2)
+    trainer._save_training_checkpoint(
+        checkpoint_path=trainer._checkpoint_path(),
+        model_state_dict=model.state_dict(),
+        optimizer_state_dict=None,
+        labels=["glass", "plastic"],
+        history=[],
+        best_epoch=1,
+        best_loss=0.4,
+        best_model_state_dict=model.state_dict(),
+        last_completed_epoch=1,
+        target_epochs=1,
+        checkpoint_kind="best",
+        interrupted=False,
+        stopped_early=False,
+        stop_reason=None,
+    )
+
+    summary = trainer.export_onnx()
+    export_report = json.loads(trainer._export_report_path().read_text(encoding="utf-8"))
+    model_manifest = json.loads(trainer._model_manifest_path().read_text(encoding="utf-8"))
+    labels_payload = json.loads(training_config.labels_output_path.read_text(encoding="utf-8"))
+
+    assert Path(str(summary["onnx_path"])).is_file()
+    assert summary["verification"]["verified"] is True
+    assert export_report["onnx_path"] == str(training_config.onnx_output_path)
+    assert model_manifest["onnx"]["verification"]["verified"] is True
+    assert model_manifest["labels"] == ["glass", "plastic"]
+    assert labels_payload == ["glass", "plastic"]
+
+
+def test_build_artifact_report_bundles_existing_training_outputs(tmp_path: Path) -> None:
+    pipeline_config = _build_two_class_manifest(
+        tmp_path / "bundle_run",
+        per_class=2,
+        random_seed=43,
+    )
+    trainer = WasteTrainer(
+        AgentPaths(
+            project_root=tmp_path,
+            dataset_dir=tmp_path / "datasets",
+            model_dir=tmp_path / "models",
+            artifact_dir=tmp_path / "artifacts",
+            log_dir=tmp_path / "logs",
+            config_dir=tmp_path / "configs",
+        ).ensure_layout(),
+        TrainingConfig(
+            manifest_path=pipeline_config.manifest_path,
+            checkpoint_dir=tmp_path / "artifacts" / "checkpoints",
+            show_progress=False,
+        ),
+    )
+
+    trainer._write_json(trainer._training_report_path(), {"epochs_completed": 1})
+    trainer._write_json(trainer._evaluation_report_path(), {"accuracy": 0.5})
+    trainer._write_json(
+        trainer._export_report_path(),
+        {"onnx_path": "models/waste_classifier.onnx"},
+    )
+    trainer._write_json(trainer._model_manifest_path(), {"labels": ["glass", "plastic"]})
+
+    report = trainer.build_artifact_report()
+
+    assert Path(str(trainer._artifact_bundle_path())).is_file()
+    assert report["training"]["epochs_completed"] == 1
+    assert report["evaluation"]["accuracy"] == 0.5
+    assert report["export"]["onnx_path"] == "models/waste_classifier.onnx"
+    assert report["model_manifest"]["labels"] == ["glass", "plastic"]
+
+
 def test_fit_prints_epoch_progress_when_progress_bars_are_disabled(
     tmp_path: Path,
     capsys,

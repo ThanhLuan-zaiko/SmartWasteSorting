@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import random
 import re
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,9 @@ MANIFEST_SCHEMA: dict[str, pl.DataType] = {
     "decode_error": pl.String,
     "raw_label": pl.String,
     "label": pl.String,
+    "label_source": pl.String,
+    "annotation_status": pl.String,
+    "annotated_at": pl.String,
     "content_hash": pl.String,
     "is_duplicate": pl.Boolean,
     "duplicate_of": pl.String,
@@ -40,6 +45,8 @@ MANIFEST_SCHEMA: dict[str, pl.DataType] = {
 }
 
 LABEL_PATTERN = re.compile(r"(.+?)[_\- ]\d+$")
+ALLOWED_LABEL_STATUSES = {"labeled", "unlabeled", "excluded"}
+TRAINABLE_ANNOTATION_STATUSES = {"inferred", "labeled"}
 
 
 class DatasetPipeline:
@@ -71,7 +78,7 @@ class DatasetPipeline:
 
     def assign_splits(self, frame: pl.DataFrame) -> pl.DataFrame:
         eligible_rows = (
-            frame.filter(pl.col("is_valid") & (pl.col("label") != self.config.unknown_label))
+            self._training_ready_frame(frame)
             .select("sample_id", "label")
             .sort(["label", "sample_id"])
             .iter_rows(named=True)
@@ -100,7 +107,7 @@ class DatasetPipeline:
         frame_without_split = frame.drop("split")
         return (
             frame_without_split.with_columns(
-                pl.struct(["sample_id", "label", "is_valid"])
+                pl.struct(["sample_id", "label", "is_valid", "annotation_status"])
                 .map_elements(
                     lambda row: self._resolve_split(row, split_map),
                     return_dtype=pl.String,
@@ -117,6 +124,7 @@ class DatasetPipeline:
         return split_frame
 
     def generate_reports(self, frame: pl.DataFrame) -> dict[str, Any]:
+        training_ready_frame = self._training_ready_frame(frame)
         summary = {
             "dataset_root": str(self.config.raw_dataset_dir),
             "manifest_path": str(self.config.manifest_path),
@@ -126,11 +134,11 @@ class DatasetPipeline:
             "decode_failed_files": frame.filter(~pl.col("decode_ok")).height,
             "too_small_files": frame.filter(pl.col("is_too_small")).height,
             "duplicate_files": frame.filter(pl.col("is_duplicate")).height,
-            "training_ready_files": frame.filter(
-                pl.col("is_valid") & (pl.col("label") != self.config.unknown_label)
-            ).height,
+            "training_ready_files": training_ready_frame.height,
             "split_counts": self._count_mapping(frame, "split"),
             "label_counts": self._count_mapping(frame, "label"),
+            "label_source_counts": self._count_mapping(frame, "label_source"),
+            "annotation_status_counts": self._count_mapping(frame, "annotation_status"),
             "extension_counts": self._count_mapping(frame, "extension"),
             "quarantine_counts": self._count_mapping(frame, "quarantine_reason"),
             "width_stats": self._dimension_stats(frame, "width"),
@@ -153,6 +161,154 @@ class DatasetPipeline:
         frame = self.load_manifest()
         return self.generate_reports(frame)
 
+    def export_labeling_template(
+        self,
+        output_path: Path | None = None,
+    ) -> dict[str, Any]:
+        frame = self.load_manifest() if self.config.manifest_path.exists() else self.run_scan()
+        destination = output_path or self.config.labeling_template_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        rows: list[dict[str, str]] = []
+        for row in frame.sort("relative_path").iter_rows(named=True):
+            label_source = str(row.get("label_source") or "unknown")
+            annotation_status = str(row.get("annotation_status") or "unlabeled")
+            current_label = str(row.get("label") or self.config.unknown_label)
+            curated_label = (
+                current_label
+                if label_source == "curated" and current_label != self.config.unknown_label
+                else ""
+            )
+            curated_status = "labeled" if curated_label else "unlabeled"
+            rows.append(
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "relative_path": str(row["relative_path"]),
+                    "file_name": str(row["file_name"]),
+                    "suggested_label": (
+                        current_label
+                        if label_source == "filename"
+                        and current_label != self.config.unknown_label
+                        else ""
+                    ),
+                    "current_label": current_label,
+                    "current_label_source": label_source,
+                    "current_annotation_status": annotation_status,
+                    "label": curated_label,
+                    "status": curated_status,
+                    "notes": "",
+                }
+            )
+
+        with destination.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "sample_id",
+                    "relative_path",
+                    "file_name",
+                    "suggested_label",
+                    "current_label",
+                    "current_label_source",
+                    "current_annotation_status",
+                    "label",
+                    "status",
+                    "notes",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        return {
+            "template_path": str(destination),
+            "total_rows": len(rows),
+            "manifest_path": str(self.config.manifest_path),
+        }
+
+    def import_labels(self, labels_file: Path) -> dict[str, Any]:
+        frame = self.load_manifest()
+        assignments = self._load_label_assignments(labels_file)
+        if not assignments:
+            raise ValueError(f"No labels found in {labels_file}")
+
+        manifest_ids = set(frame.get_column("sample_id").to_list())
+        assignment_ids = set(assignments)
+        missing_ids = sorted(assignment_ids - manifest_ids)
+        if missing_ids:
+            preview = ", ".join(missing_ids[:5])
+            raise ValueError(
+                "Label file contains unknown sample_id values not present in the manifest: "
+                f"{preview}"
+            )
+
+        updated_records: list[dict[str, Any]] = []
+        updated_count = 0
+        labeled_count = 0
+        excluded_count = 0
+        unlabeled_count = 0
+        for row in frame.iter_rows(named=True):
+            record = dict(row)
+            assignment = assignments.get(str(record["sample_id"]))
+            if assignment is not None:
+                record.update(assignment)
+                updated_count += 1
+                status = str(record["annotation_status"])
+                if status == "labeled":
+                    labeled_count += 1
+                elif status == "excluded":
+                    excluded_count += 1
+                else:
+                    unlabeled_count += 1
+            updated_records.append(record)
+
+        updated_frame = self.assign_splits(self._frame_from_records(updated_records))
+        self.write_manifest(updated_frame)
+        report_summary = self.generate_reports(updated_frame)
+        validation_summary = self.validate_labels(updated_frame)
+        return {
+            "labels_file": str(labels_file),
+            "manifest_path": str(self.config.manifest_path),
+            "updated_rows": updated_count,
+            "labeled_rows": labeled_count,
+            "excluded_rows": excluded_count,
+            "unlabeled_rows": unlabeled_count,
+            "training_ready_files": int(report_summary["training_ready_files"]),
+            "validation": validation_summary,
+        }
+
+    def validate_labels(self, frame: pl.DataFrame | None = None) -> dict[str, Any]:
+        source_frame = frame if frame is not None else self.load_manifest()
+        training_ready_frame = self._training_ready_frame(source_frame)
+        curated_frame = source_frame.filter(pl.col("label_source") == "curated")
+        source_counts = self._count_mapping(source_frame, "label_source")
+        status_counts = self._count_mapping(source_frame, "annotation_status")
+        class_names = self.class_names(source_frame)
+        warnings: list[str] = []
+        if len(class_names) < 2:
+            warnings.append("Training requires at least 2 classes in the current manifest.")
+        if training_ready_frame.height == 0:
+            warnings.append("No training-ready samples remain after validation filters.")
+        if int(source_counts.get("curated", 0)) == 0 and int(source_counts.get("filename", 0)) > 0:
+            warnings.append(
+                "The manifest still relies entirely on filename-derived labels."
+            )
+        if int(status_counts.get("unlabeled", 0)) > 0:
+            warnings.append("Some samples are still unlabeled and will be excluded from training.")
+
+        summary = {
+            "manifest_path": str(self.config.manifest_path),
+            "num_classes": len(class_names),
+            "class_names": class_names,
+            "total_files": source_frame.height,
+            "training_ready_files": training_ready_frame.height,
+            "curated_files": curated_frame.height,
+            "label_source_counts": source_counts,
+            "annotation_status_counts": status_counts,
+            "train_label_counts": self.train_label_counts(source_frame),
+            "warnings": warnings,
+        }
+        return summary
+
     def run_all(self) -> pl.DataFrame:
         frame = self.scan()
         split_frame = self.assign_splits(frame)
@@ -165,12 +321,66 @@ class DatasetPipeline:
             raise FileNotFoundError(
                 f"Manifest not found at {self.config.manifest_path}. Run the `scan` command first."
             )
-        return pl.read_parquet(self.config.manifest_path)
+        return self._ensure_manifest_columns(pl.read_parquet(self.config.manifest_path))
 
     def write_manifest(self, frame: pl.DataFrame) -> None:
         self.config.manifest_dir.mkdir(parents=True, exist_ok=True)
-        frame.sort("relative_path").write_parquet(self.config.manifest_path)
-        frame.sort("relative_path").write_csv(self.config.manifest_csv_path)
+        normalized_frame = self._ensure_manifest_columns(frame)
+        normalized_frame.sort("relative_path").write_parquet(self.config.manifest_path)
+        normalized_frame.sort("relative_path").write_csv(self.config.manifest_csv_path)
+
+    def class_names(self, frame: pl.DataFrame) -> list[str]:
+        return (
+            self._training_ready_frame(frame)
+            .get_column("label")
+            .unique()
+            .sort()
+            .to_list()
+        )
+
+    def train_label_counts(self, frame: pl.DataFrame) -> dict[str, int]:
+        counts = {label: 0 for label in self.class_names(frame)}
+        for row in (
+            self._training_ready_frame(frame)
+            .filter(pl.col("split") == "train")
+            .group_by("label")
+            .len(name="count")
+            .iter_rows(named=True)
+        ):
+            counts[str(row["label"])] = int(row["count"])
+        return counts
+
+    def _ensure_manifest_columns(self, frame: pl.DataFrame) -> pl.DataFrame:
+        result = frame
+        if "raw_label" not in result.columns:
+            result = result.with_columns(pl.col("label").alias("raw_label"))
+        if "label_source" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != self.config.unknown_label)
+                .then(pl.lit("filename"))
+                .otherwise(pl.lit("unknown"))
+                .alias("label_source")
+            )
+        if "annotation_status" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != self.config.unknown_label)
+                .then(pl.lit("inferred"))
+                .otherwise(pl.lit("unlabeled"))
+                .alias("annotation_status")
+            )
+        if "annotated_at" not in result.columns:
+            result = result.with_columns(pl.lit(None, dtype=pl.String).alias("annotated_at"))
+
+        return result.select(
+            [
+                (
+                    pl.col(name).cast(data_type, strict=False)
+                    if name in result.columns
+                    else pl.lit(None, dtype=data_type)
+                ).alias(name)
+                for name, data_type in MANIFEST_SCHEMA.items()
+            ]
+        )
 
     def _iter_image_paths(self) -> list[Path]:
         if not self.config.raw_dataset_dir.exists():
@@ -190,6 +400,8 @@ class DatasetPipeline:
     def _inspect_image(self, image_path: Path) -> dict[str, Any]:
         relative_path = image_path.relative_to(self.config.raw_dataset_dir).as_posix()
         raw_label, label = self._infer_label(image_path.stem)
+        label_source = "filename" if label != self.config.unknown_label else "unknown"
+        annotation_status = "inferred" if label != self.config.unknown_label else "unlabeled"
         width: int | None = None
         height: int | None = None
         channels: int | None = None
@@ -226,6 +438,9 @@ class DatasetPipeline:
             "decode_error": decode_error,
             "raw_label": raw_label,
             "label": label,
+            "label_source": label_source,
+            "annotation_status": annotation_status,
+            "annotated_at": None,
             "content_hash": self._hash_file(image_path),
             "is_duplicate": False,
             "duplicate_of": None,
@@ -323,6 +538,8 @@ class DatasetPipeline:
             return "excluded"
         if str(row["label"]) == self.config.unknown_label:
             return "excluded"
+        if str(row["annotation_status"]) not in TRAINABLE_ANNOTATION_STATUSES:
+            return "excluded"
         return split_map.get(str(row["sample_id"]), "excluded")
 
     def _count_mapping(self, frame: pl.DataFrame, column_name: str) -> dict[str, int]:
@@ -363,6 +580,95 @@ class DatasetPipeline:
         table = frame.group_by(column_name).len(name="count").sort(column_name, nulls_last=True)
         table.write_csv(output_path)
 
+    def _training_ready_frame(self, frame: pl.DataFrame) -> pl.DataFrame:
+        return frame.filter(
+            pl.col("is_valid")
+            & (pl.col("label") != self.config.unknown_label)
+            & pl.col("annotation_status").is_in(sorted(TRAINABLE_ANNOTATION_STATUSES))
+        )
+
+    def _load_label_assignments(self, labels_file: Path) -> dict[str, dict[str, Any]]:
+        suffix = labels_file.suffix.lower()
+        if suffix == ".csv":
+            rows = self._read_label_csv(labels_file)
+        elif suffix in {".jsonl", ".ndjson"}:
+            rows = self._read_label_jsonl(labels_file)
+        elif suffix == ".json":
+            rows = self._read_label_json(labels_file)
+        else:
+            raise ValueError(
+                f"Unsupported labels file format: {labels_file}. Use .csv, .json, or .jsonl"
+            )
+
+        assignments: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            sample_id = str(row.get("sample_id", "")).strip()
+            if not sample_id:
+                raise ValueError("Each label record must include a non-empty sample_id.")
+            label_text = str(row.get("label", "") or "").strip()
+            raw_status = row.get("status", row.get("annotation_status"))
+            status = self._normalize_annotation_status(raw_status, label_text=label_text)
+            normalized_label = (
+                self._normalize_label(label_text) if label_text else self.config.unknown_label
+            )
+            if status == "labeled" and normalized_label == self.config.unknown_label:
+                raise ValueError(
+                    f"Label record for {sample_id} is marked labeled but has no usable label."
+                )
+            if status != "labeled":
+                normalized_label = self.config.unknown_label
+
+            assignments[sample_id] = {
+                "label": normalized_label,
+                "label_source": "curated" if status == "labeled" else "unknown",
+                "annotation_status": status,
+                "annotated_at": (
+                    str(row.get("annotated_at")).strip()
+                    if row.get("annotated_at") not in {None, ""}
+                    else (
+                        datetime.now(UTC).isoformat(timespec="seconds")
+                        if status in {"labeled", "excluded"}
+                        else None
+                    )
+                ),
+            }
+        return assignments
+
+    def _normalize_annotation_status(self, value: Any, *, label_text: str) -> str:
+        if value is None or str(value).strip() == "":
+            return "labeled" if label_text else "unlabeled"
+
+        normalized = str(value).strip().casefold()
+        if normalized in {"labeled", "labelled", "curated"}:
+            return "labeled"
+        if normalized in {"unlabeled", "unlabelled", "pending", "unknown"}:
+            return "unlabeled"
+        if normalized in {"excluded", "skip", "ignored"}:
+            return "excluded"
+        raise ValueError(f"Unsupported annotation status: {value}")
+
+    def _read_label_csv(self, labels_file: Path) -> list[dict[str, Any]]:
+        with labels_file.open("r", encoding="utf-8", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+
+    def _read_label_json(self, labels_file: Path) -> list[dict[str, Any]]:
+        payload = json.loads(labels_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("JSON label files must contain a list of records.")
+        return [dict(row) for row in payload]
+
+    def _read_label_jsonl(self, labels_file: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for line in labels_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            if not isinstance(payload, dict):
+                raise ValueError("Each JSONL line must be an object.")
+            rows.append(dict(payload))
+        return rows
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dataset pipeline for localagent")
@@ -378,10 +684,17 @@ def build_parser() -> argparse.ArgumentParser:
     common_parent.add_argument("--val-ratio", type=float, default=None)
     common_parent.add_argument("--test-ratio", type=float, default=None)
     common_parent.add_argument("--seed", type=int, default=None)
+    common_parent.add_argument("--no-filename-labels", action="store_true")
     common_parent.add_argument("--no-progress", action="store_true")
 
-    for command in ("scan", "split", "report", "run-all"):
+    for command in ("scan", "split", "report", "run-all", "validate-labels"):
         subparsers.add_parser(command, parents=[common_parent])
+
+    export_parser = subparsers.add_parser("export-labeling-template", parents=[common_parent])
+    export_parser.add_argument("--output", type=Path, default=None)
+
+    import_parser = subparsers.add_parser("import-labels", parents=[common_parent])
+    import_parser.add_argument("--labels-file", type=Path, required=True)
 
     return parser
 
@@ -394,6 +707,7 @@ def build_config(args: argparse.Namespace) -> DatasetPipelineConfig:
         report_dir=args.report_dir or defaults.report_dir,
         manifest_name=defaults.manifest_name,
         manifest_csv_name=defaults.manifest_csv_name,
+        labeling_template_name=defaults.labeling_template_name,
         min_width=defaults.min_width if args.min_width is None else args.min_width,
         min_height=defaults.min_height if args.min_height is None else args.min_height,
         train_ratio=defaults.train_ratio if args.train_ratio is None else args.train_ratio,
@@ -402,7 +716,11 @@ def build_config(args: argparse.Namespace) -> DatasetPipelineConfig:
         random_seed=defaults.random_seed if args.seed is None else args.seed,
         allowed_extensions=defaults.allowed_extensions,
         hash_algorithm=defaults.hash_algorithm,
-        infer_labels_from_filename=defaults.infer_labels_from_filename,
+        infer_labels_from_filename=(
+            defaults.infer_labels_from_filename
+            if not getattr(args, "no_filename_labels", False)
+            else False
+        ),
         unknown_label=defaults.unknown_label,
         show_progress=not args.no_progress,
     )
@@ -429,6 +747,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Wrote dataset report to {pipeline.config.summary_path} "
             f"({summary['total_files']} files)"
         )
+        return 0
+
+    if args.command == "export-labeling-template":
+        summary = pipeline.export_labeling_template(output_path=args.output)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "import-labels":
+        summary = pipeline.import_labels(args.labels_file)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "validate-labels":
+        summary = pipeline.validate_labels()
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
     frame = pipeline.run_all()

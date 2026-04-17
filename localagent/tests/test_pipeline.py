@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import shutil
 from pathlib import Path
@@ -191,3 +192,75 @@ def test_scan_infers_normalized_label_names(tmp_path: Path) -> None:
 
     assert row["raw_label"] == "Miscellaneous Trash"
     assert row["label"] == "miscellaneous_trash"
+
+
+def test_pipeline_can_export_template_and_import_curated_labels(tmp_path: Path) -> None:
+    config = _build_config(
+        tmp_path,
+        train_ratio=0.5,
+        val_ratio=0.25,
+        test_ratio=0.25,
+    )
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("R_1.jpg", 50),
+        ("R_2.jpg", 55),
+        ("B_1.jpg", 80),
+        ("B_2.jpg", 85),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    frame = pipeline.run_all()
+    template_summary = pipeline.export_labeling_template()
+    template_path = Path(str(template_summary["template_path"]))
+    template_rows = list(csv.DictReader(template_path.open("r", encoding="utf-8", newline="")))
+    row_by_sample = {row["sample_id"]: row for row in template_rows}
+
+    assert frame.height == 4
+    assert template_path.is_file()
+    assert template_rows
+    assert all(row["label"] == "" for row in template_rows)
+    assert {row["suggested_label"] for row in template_rows} == {"b", "r"}
+
+    labels_file = tmp_path / "curated_labels.csv"
+    with labels_file.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_id", "label", "status"])
+        writer.writeheader()
+        for sample_id, label in (
+            (template_rows[0]["sample_id"], "glass"),
+            (template_rows[1]["sample_id"], "glass"),
+            (template_rows[2]["sample_id"], "plastic"),
+            (template_rows[3]["sample_id"], "plastic"),
+        ):
+            writer.writerow({"sample_id": sample_id, "label": label, "status": "labeled"})
+
+    import_summary = pipeline.import_labels(labels_file)
+    manifest_frame = pipeline.load_manifest()
+    validation = pipeline.validate_labels(manifest_frame)
+    manifest_rows = {row["sample_id"]: row for row in manifest_frame.iter_rows(named=True)}
+
+    assert import_summary["updated_rows"] == 4
+    assert import_summary["labeled_rows"] == 4
+    assert validation["num_classes"] == 2
+    assert validation["class_names"] == ["glass", "plastic"]
+    assert validation["warnings"] == []
+    assert manifest_rows[template_rows[0]["sample_id"]]["label_source"] == "curated"
+    assert manifest_rows[template_rows[0]["sample_id"]]["annotation_status"] == "labeled"
+    assert manifest_rows[template_rows[0]["sample_id"]]["label"] == "glass"
+    assert row_by_sample[template_rows[0]["sample_id"]]["current_label_source"] == "filename"
+
+
+def test_validate_labels_warns_when_manifest_has_single_class(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.raw_dataset_dir.mkdir(parents=True)
+    _write_rgb_image(config.raw_dataset_dir / "R_1.jpg", width=64, height=64, value=20)
+    _write_rgb_image(config.raw_dataset_dir / "R_2.jpg", width=64, height=64, value=25)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    validation = pipeline.validate_labels()
+
+    assert validation["num_classes"] == 1
+    assert any("at least 2 classes" in warning for warning in validation["warnings"])

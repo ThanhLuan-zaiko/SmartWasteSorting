@@ -85,3 +85,26 @@ def test_explicit_flags_override_training_preset() -> None:
     assert config.batch_size == 24
     assert config.image_size == 224
     assert config.cache_format == "raw"
+
+
+def test_build_config_accepts_onnx_export_flags() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "export-onnx",
+            "--onnx-output",
+            "models/custom.onnx",
+            "--onnx-opset",
+            "18",
+            "--export-batch-size",
+            "2",
+            "--skip-onnx-verify",
+        ]
+    )
+    config = build_config(args)
+
+    assert str(config.onnx_output_path).endswith("models\\custom.onnx")
+    assert config.onnx_opset == 18
+    assert config.export_batch_size == 2
+    assert config.verify_onnx is False

@@ -72,6 +72,7 @@ logs/**/*.log
 *.safetensors
 *.pdb
 localagent/models/labels.json
+localagent/models/model_manifest.json
 
 # Local datasets
 localagent/dataset/

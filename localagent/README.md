@@ -37,9 +37,15 @@ cd localagent
 uv sync --dev
 uv run maturin develop
 uv run python -m localagent.data.pipeline run-all
+uv run python -m localagent.data.pipeline export-labeling-template
+uv run python -m localagent.data.pipeline import-labels --labels-file artifacts/manifests/labeling_template.csv
+uv run python -m localagent.data.pipeline validate-labels
 uv run python -m localagent.training.train summary
 uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
+uv run python -m localagent.training.train evaluate
+uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train report
 ```
 
 ## Hai pipeline đang có
@@ -59,6 +65,14 @@ Lệnh:
 ```powershell
 cd localagent
 uv run python -m localagent.data.pipeline run-all
+```
+
+Khi ảnh thô chưa có nhãn chuẩn, dùng thêm:
+
+```powershell
+uv run python -m localagent.data.pipeline export-labeling-template
+uv run python -m localagent.data.pipeline import-labels --labels-file artifacts/manifests/labeling_template.csv
+uv run python -m localagent.data.pipeline validate-labels
 ```
 
 Đầu ra chính:
@@ -87,6 +101,9 @@ cd localagent
 uv run python -m localagent.training.train summary
 uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
+uv run python -m localagent.training.train evaluate
+uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train report
 ```
 
 Một số cờ hữu ích:
@@ -120,6 +137,38 @@ Trainer hiện sẽ tự lưu:
 - checkpoint resume mới nhất ở `artifacts/checkpoints/<experiment_name>.last.pt`
 - benchmark theo lớp ở `artifacts/reports/<experiment_name>_evaluation.json`
 - confusion matrix ở `artifacts/reports/<experiment_name>_confusion_matrix.csv`
+- báo cáo train ở `artifacts/reports/<experiment_name>_training.json`
+- báo cáo export ở `artifacts/reports/<experiment_name>_export.json`
+- model manifest ở `models/model_manifest.json`
+
+### 3. API artifact từ Actix
+
+Server Rust hiện có thể đọc trực tiếp JSON artifact để interface gọi:
+
+```powershell
+cd localagent
+cargo run --bin localagent-server
+```
+
+Các endpoint chính:
+
+- `GET /health`
+- `POST /classify`
+- `GET /dashboard/summary?experiment=<name>`
+- `GET /artifacts/overview?experiment=<name>`
+- `GET /artifacts/training?experiment=<name>`
+- `GET /artifacts/training-overview?experiment=<name>`
+- `GET /artifacts/evaluation?experiment=<name>`
+- `GET /artifacts/export?experiment=<name>`
+- `GET /artifacts/benchmarks?experiment=<name>`
+- `GET /artifacts/model-manifest`
+
+### 4. Rust đang hỗ trợ gì cho training
+
+- Rust hỗ trợ mạnh ở phần warm-cache ảnh, đọc artifact JSON và API benchmark/report.
+- Rust hiện cũng hỗ trợ tính `class_weight_map` và classification report cho benchmark qua bridge.
+- Phần forward/backward, update weight/bias theo epoch vẫn do PyTorch native backend đảm nhiệm.
+- Nếu muốn Rust tham gia trực tiếp vào optimizer/backprop, bước tiếp theo sẽ là tách trainer sang stack như `tch`, `burn` hoặc `candle`, không chỉ thêm helper quanh pipeline hiện tại.
 
 Khi resume, hãy giữ nguyên `--experiment-name` để trainer đọc đúng file `artifacts/checkpoints/<experiment_name>.last.pt`.
 

@@ -36,7 +36,12 @@ class RuntimeConfig:
     model_path: Path = field(
         default_factory=lambda: _project_root() / "models" / "waste_classifier.onnx"
     )
+    model_manifest_path: Path = field(
+        default_factory=lambda: _project_root() / "models" / "model_manifest.json"
+    )
     labels_path: Path = field(default_factory=lambda: _project_root() / "models" / "labels.json")
+    artifact_dir: Path = field(default_factory=lambda: _project_root() / "artifacts")
+    experiment_name: str = "baseline-waste-sorter"
     device: str = "cpu"
     score_threshold: float = 0.45
     server_host: str = "127.0.0.1"
@@ -70,6 +75,12 @@ class TrainingConfig:
     labels_output_path: Path = field(
         default_factory=lambda: _project_root() / "models" / "labels.json"
     )
+    onnx_output_path: Path = field(
+        default_factory=lambda: _project_root() / "models" / "waste_classifier.onnx"
+    )
+    model_manifest_output_path: Path = field(
+        default_factory=lambda: _project_root() / "models" / "model_manifest.json"
+    )
     checkpoint_dir: Path = field(
         default_factory=lambda: _project_root() / "artifacts" / "checkpoints"
     )
@@ -78,6 +89,10 @@ class TrainingConfig:
         default_factory=lambda: _project_root() / "artifacts" / "cache" / "training"
     )
     cache_format: str = "png"
+    onnx_opset: int = 17
+    verify_onnx: bool = True
+    export_batch_size: int = 1
+    normalization_preset: str = "imagenet"
     use_rust_image_cache: bool = True
     force_rebuild_cache: bool = False
     class_bias_strategy: str = "none"
@@ -95,6 +110,7 @@ class DatasetPipelineConfig:
     report_dir: Path = field(default_factory=lambda: _project_root() / "artifacts" / "reports")
     manifest_name: str = "dataset_manifest.parquet"
     manifest_csv_name: str = "dataset_manifest.csv"
+    labeling_template_name: str = "labeling_template.csv"
     min_width: int = 32
     min_height: int = 32
     train_ratio: float = 0.8
@@ -114,6 +130,10 @@ class DatasetPipelineConfig:
     @property
     def manifest_csv_path(self) -> Path:
         return self.manifest_dir / self.manifest_csv_name
+
+    @property
+    def labeling_template_path(self) -> Path:
+        return self.manifest_dir / self.labeling_template_name
 
     @property
     def summary_path(self) -> Path:

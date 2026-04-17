@@ -40,3 +40,36 @@ class RustAccelerationBridge:
             show_progress=bool(show_progress),
         )
         return json.loads(payload)
+
+    def compute_class_weight_map(
+        self,
+        train_labels: list[str],
+        class_names: list[str],
+    ) -> dict[str, float] | None:
+        extension = load_extension()
+        if extension is None:
+            return None
+
+        payload = extension.compute_class_weight_map_json(
+            train_labels=list(train_labels),
+            class_names=list(class_names),
+        )
+        return json.loads(payload)
+
+    def build_classification_report(
+        self,
+        *,
+        predictions: list[int],
+        targets: list[int],
+        class_names: list[str],
+    ) -> dict[str, Any] | None:
+        extension = load_extension()
+        if extension is None:
+            return None
+
+        payload = extension.build_classification_report_json(
+            predictions=list(predictions),
+            targets=list(targets),
+            class_names=list(class_names),
+        )
+        return json.loads(payload)

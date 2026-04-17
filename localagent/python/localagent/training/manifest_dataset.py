@@ -18,18 +18,27 @@ class ManifestImageDataset:
         image_size: int = 224,
         cache_dir: Path | None = None,
         cache_format: str = "png",
+        normalization_preset: str = "imagenet",
         transform: Any | None = None,
     ) -> None:
         self.image_size = image_size
         self.label_to_index = label_to_index
         self.cache_dir = cache_dir
         self.cache_suffix = ".raw" if cache_format == "raw" else ".png"
-        self.transform = transform or build_training_transforms(image_size)
-        self.cached_transform = build_training_transforms(image_size, pre_resized=True)
+        self.transform = transform or build_training_transforms(
+            image_size,
+            normalization_preset=normalization_preset,
+        )
+        self.cached_transform = build_training_transforms(
+            image_size,
+            pre_resized=True,
+            normalization_preset=normalization_preset,
+        )
         self.records = list(
             frame.filter(
                 pl.col("is_valid")
                 & (pl.col("label") != "unknown")
+                & ~pl.col("annotation_status").is_in(["unlabeled", "excluded"])
                 & (pl.col("split") == split)
             )
             .sort("sample_id")

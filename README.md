@@ -141,6 +141,17 @@ cd localagent
 cargo run --bin localagent-server
 ```
 
+Server hiện đã đọc được các JSON artifact của trainer để trả API cho UI/CLI, gồm:
+
+- `GET /dashboard/summary`
+- `GET /artifacts/overview`
+- `GET /artifacts/training`
+- `GET /artifacts/training-overview`
+- `GET /artifacts/evaluation`
+- `GET /artifacts/export`
+- `GET /artifacts/benchmarks`
+- `GET /artifacts/model-manifest`
+
 ## Hai pipeline chính
 
 Hiện tại `localagent` xoay quanh 2 pipeline chạy nối tiếp nhau:
@@ -155,9 +166,15 @@ cd localagent
 uv sync --dev
 uv run maturin develop
 uv run python -m localagent.data.pipeline run-all
+uv run python -m localagent.data.pipeline export-labeling-template
+uv run python -m localagent.data.pipeline import-labels --labels-file artifacts/manifests/labeling_template.csv
+uv run python -m localagent.data.pipeline validate-labels
 uv run python -m localagent.training.train summary
 uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
+uv run python -m localagent.training.train evaluate
+uv run python -m localagent.training.train export-onnx
+uv run python -m localagent.training.train report
 ```
 
 ## Pipeline dữ liệu ảnh thô
@@ -211,6 +228,14 @@ Hoặc chạy toàn bộ:
 
 ```powershell
 uv run python -m localagent.data.pipeline run-all
+```
+
+Khi dataset chưa có nhãn chuẩn, dùng thêm:
+
+```powershell
+uv run python -m localagent.data.pipeline export-labeling-template
+uv run python -m localagent.data.pipeline import-labels --labels-file artifacts/manifests/labeling_template.csv
+uv run python -m localagent.data.pipeline validate-labels
 ```
 
 Nếu muốn tắt progress bar:
@@ -331,6 +356,9 @@ Pipeline huấn luyện hiện có 4 lớp trách nhiệm:
 - `summary`: đọc manifest và cho bạn thấy dữ liệu có đủ điều kiện train hay chưa
 - `warm-cache`: dùng Rust để chuẩn bị ảnh resize sẵn, giảm chi phí I/O và resize lặp lại
 - `fit`: train mô hình baseline từ manifest với backbone nhẹ
+- `evaluate`: chạy đánh giá độc lập từ checkpoint và ghi JSON benchmark
+- `export-onnx`: xuất model `.onnx`, verify bằng `onnxruntime`, và sinh `model_manifest.json`
+- `report`: gom các artifact JSON để CLI hoặc Actix dùng lại
 - checkpoint/output: lưu kết quả train để dùng cho bước suy luận sau
 
 Nếu CLI đang hiển thị progress bar, đó là bình thường. Hiện progress bar có ở:

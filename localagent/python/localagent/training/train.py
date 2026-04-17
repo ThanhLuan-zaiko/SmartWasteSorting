@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--device", type=str, default=None)
     common.add_argument("--cache-dir", type=Path, default=None)
     common.add_argument("--resume-from", type=Path, default=None)
+    common.add_argument("--checkpoint", type=Path, default=None)
+    common.add_argument("--onnx-output", type=Path, default=None)
     common.add_argument("--cache-format", choices=("png", "raw"), default=None)
     common.add_argument("--no-rust-cache", action="store_true")
     common.add_argument("--force-cache", action="store_true")
@@ -72,12 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--early-stopping-patience", type=int, default=None)
     common.add_argument("--early-stopping-min-delta", type=float, default=None)
     common.add_argument("--disable-early-stopping", action="store_true")
+    common.add_argument("--onnx-opset", type=int, default=None)
+    common.add_argument("--export-batch-size", type=int, default=None)
+    common.add_argument("--skip-onnx-verify", action="store_true")
     common.add_argument("--no-progress", action="store_true")
 
     subparsers.add_parser("summary", parents=[common])
     subparsers.add_parser("export-labels", parents=[common])
     subparsers.add_parser("warm-cache", parents=[common])
     subparsers.add_parser("fit", parents=[common])
+    subparsers.add_parser("evaluate", parents=[common])
+    subparsers.add_parser("export-onnx", parents=[common])
+    subparsers.add_parser("report", parents=[common])
     return parser
 
 
@@ -117,9 +125,15 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         weight_decay=defaults.weight_decay,
         manifest_path=defaults.manifest_path if args.manifest is None else args.manifest,
         labels_output_path=defaults.labels_output_path,
+        onnx_output_path=(
+            defaults.onnx_output_path if args.onnx_output is None else args.onnx_output
+        ),
+        model_manifest_output_path=defaults.model_manifest_output_path,
         checkpoint_dir=defaults.checkpoint_dir,
         resume_from_checkpoint=(
-            defaults.resume_from_checkpoint if args.resume_from is None else args.resume_from
+            defaults.resume_from_checkpoint
+            if args.resume_from is None
+            else args.resume_from
         ),
         cache_dir=defaults.cache_dir if args.cache_dir is None else args.cache_dir,
         cache_format=_resolve_value(
@@ -128,6 +142,14 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
             preset_key="cache_format",
             default_value=defaults.cache_format,
         ),
+        onnx_opset=defaults.onnx_opset if args.onnx_opset is None else args.onnx_opset,
+        verify_onnx=not args.skip_onnx_verify,
+        export_batch_size=(
+            defaults.export_batch_size
+            if args.export_batch_size is None
+            else args.export_batch_size
+        ),
+        normalization_preset=defaults.normalization_preset,
         use_rust_image_cache=not args.no_rust_cache,
         force_rebuild_cache=bool(args.force_cache),
         class_bias_strategy=_resolve_value(
@@ -169,6 +191,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "warm-cache":
         summary = trainer.warm_image_cache()
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "evaluate":
+        summary = trainer.evaluate(checkpoint_path=args.checkpoint)
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "export-onnx":
+        summary = trainer.export_onnx(
+            checkpoint_path=args.checkpoint,
+            output_path=args.onnx_output,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "report":
+        summary = trainer.build_artifact_report()
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 

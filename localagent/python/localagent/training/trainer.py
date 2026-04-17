@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import csv
 import json
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from localagent.config import AgentPaths, TrainingConfig
 from localagent.data import DatasetIndex
 from localagent.training.manifest_dataset import ManifestImageDataset
 from localagent.utils import TerminalProgressBar
+from localagent.vision import normalization_stats
 
 SUPPORTED_CNN_MODELS = (
     "mobilenet_v3_small",
@@ -49,6 +52,7 @@ class WasteTrainer:
             "dataset_size": len(dataset_index) if dataset_index is not None else 0,
             "artifact_dir": str(self.paths.artifact_dir),
             "manifest_path": str(self.config.manifest_path),
+            "training_report_path": str(self._training_report_path()),
             "resume_from_checkpoint": (
                 None
                 if self.config.resume_from_checkpoint is None
@@ -64,6 +68,14 @@ class WasteTrainer:
             "cache_failure_report_path": str(self._cache_failure_report_path()),
             "evaluation_report_path": str(self._evaluation_report_path()),
             "confusion_matrix_path": str(self._confusion_matrix_path()),
+            "export_report_path": str(self._export_report_path()),
+            "artifact_bundle_path": str(self._artifact_bundle_path()),
+            "onnx_output_path": str(self.config.onnx_output_path),
+            "model_manifest_path": str(self._model_manifest_path()),
+            "onnx_opset": self.config.onnx_opset,
+            "verify_onnx": self.config.verify_onnx,
+            "export_batch_size": self.config.export_batch_size,
+            "normalization_preset": self.config.normalization_preset,
             "class_bias_strategy": self.config.class_bias_strategy,
             "early_stopping_patience": self.config.early_stopping_patience,
             "early_stopping_min_delta": self.config.early_stopping_min_delta,
@@ -154,6 +166,8 @@ class WasteTrainer:
             "pretrained_backbone_requested": self.config.pretrained_backbone,
             "pretrained_backbone_loaded": pretrained_loaded,
             "freeze_backbone": self.config.freeze_backbone,
+            "image_size": self.config.image_size,
+            "normalization_preset": self.config.normalization_preset,
         }
         return model
 
@@ -189,21 +203,15 @@ class WasteTrainer:
             return
         raise ValueError(f"Unsupported model_name: {self.config.model_name}")
 
-    def export_onnx_stub(self, output_path: Path | None = None) -> Path:
-        destination = output_path or self.paths.model_dir / "waste_classifier.onnx"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.touch(exist_ok=True)
-        return destination
-
     def load_manifest(self, manifest_path: Path | None = None) -> pl.DataFrame:
         source = manifest_path or self.config.manifest_path
         if not source.exists():
             raise FileNotFoundError(f"Manifest file does not exist: {source}")
-        return pl.read_parquet(source)
+        return self._ensure_manifest_columns(pl.read_parquet(source))
 
     def class_names(self, manifest_frame: pl.DataFrame) -> list[str]:
         return (
-            manifest_frame.filter(pl.col("is_valid") & (pl.col("label") != "unknown"))
+            self._labeled_frame(manifest_frame)
             .get_column("label")
             .unique()
             .sort()
@@ -232,6 +240,19 @@ class WasteTrainer:
         return max(counts) / min(counts)
 
     def class_weight_map(self, manifest_frame: pl.DataFrame) -> dict[str, float]:
+        class_names = self.class_names(manifest_frame)
+        train_labels = [
+            str(row["label"])
+            for row in self._labeled_frame(manifest_frame)
+            .filter(pl.col("split") == "train")
+            .sort("sample_id")
+            .select("label")
+            .iter_rows(named=True)
+        ]
+        rust_result = self.rust_acceleration.compute_class_weight_map(train_labels, class_names)
+        if rust_result is not None:
+            return {str(label): float(weight) for label, weight in rust_result.items()}
+
         counts = self.train_label_counts(manifest_frame)
         present_labels = [label for label, count in counts.items() if count > 0]
         if not present_labels:
@@ -264,6 +285,7 @@ class WasteTrainer:
                 image_size=self.config.image_size,
                 cache_dir=cache_dir,
                 cache_format=self.config.cache_format,
+                normalization_preset=self.config.normalization_preset,
             )
             for split in ("train", "val", "test")
         }
@@ -320,10 +342,7 @@ class WasteTrainer:
     ) -> Path:
         frame = manifest_frame if manifest_frame is not None else self.load_manifest(manifest_path)
         labels = self.class_names(frame)
-        destination = output_path or self.config.labels_output_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(labels, indent=2), encoding="utf-8")
-        return destination
+        return self._write_labels_payload(labels, output_path=output_path)
 
     def _compute_best_loss_from_history(self, history: list[dict[str, Any]]) -> float:
         best_loss = float("inf")
@@ -444,6 +463,16 @@ class WasteTrainer:
                 else str(self.config.resume_from_checkpoint)
             ),
             "model": self._last_model_metadata,
+            "training_config": {
+                "model_name": self.config.model_name,
+                "image_size": self.config.image_size,
+                "normalization_preset": self.config.normalization_preset,
+                "batch_size": self.config.batch_size,
+                "epochs": self.config.epochs,
+                "cache_format": self.config.cache_format,
+                "class_bias_strategy": self.config.class_bias_strategy,
+                "onnx_opset": self.config.onnx_opset,
+            },
             "cache_format": self.config.cache_format,
             "class_bias_strategy": self.config.class_bias_strategy,
             "stopped_early": stopped_early,
@@ -502,6 +531,14 @@ class WasteTrainer:
         targets: list[int],
         class_names: list[str],
     ) -> dict[str, Any]:
+        rust_report = self.rust_acceleration.build_classification_report(
+            predictions=predictions,
+            targets=targets,
+            class_names=class_names,
+        )
+        if rust_report is not None:
+            return rust_report
+
         num_classes = len(class_names)
         confusion_matrix = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
         for target, prediction in zip(targets, predictions, strict=False):
@@ -576,6 +613,254 @@ class WasteTrainer:
                 writer.writerow([label, *row])
         return report_path, confusion_path
 
+    def evaluate(
+        self,
+        *,
+        manifest_path: Path | None = None,
+        checkpoint_path: Path | None = None,
+    ) -> dict[str, Any]:
+        import torch.nn as nn
+
+        frame = self.load_manifest(manifest_path)
+        checkpoint_source = (
+            checkpoint_path
+            or self.config.resume_from_checkpoint
+            or self._checkpoint_path()
+        )
+        payload = self._load_checkpoint_payload(checkpoint_source)
+        overrides = self._checkpoint_training_overrides(payload)
+
+        with self._temporary_config(**overrides):
+            cache_summary = self.warm_image_cache(manifest_frame=frame)
+            cache_dir = Path(cache_summary["cache_dir"]) if cache_summary is not None else None
+            loaders, label_to_index = self.build_dataloaders(
+                manifest_frame=frame,
+                cache_dir=cache_dir,
+            )
+            class_names = list(payload.get("labels") or self.class_names(frame))
+            self._require_trainable_classes(class_names)
+            split_name = self._evaluation_split_name(loaders)
+            if split_name is None:
+                raise RuntimeError("Evaluation requires a non-empty test or validation split.")
+
+            model = self.build_model_stub(num_classes=len(class_names))
+            state_dict = payload.get("best_model_state_dict") or payload.get("model_state_dict")
+            if state_dict is None:
+                raise ValueError(f"Checkpoint has no model weights: {checkpoint_source}")
+            model.load_state_dict(state_dict)
+
+            device = self._resolve_device()
+            model.to(device)
+            criterion = nn.CrossEntropyLoss(
+                weight=self._loss_class_weights(frame, label_to_index, device=device)
+            )
+            metrics = self._run_epoch(
+                model=model,
+                loader=loaders[split_name],
+                criterion=criterion,
+                optimizer=None,
+                device=device,
+                training=False,
+                stage_name=split_name,
+                collect_predictions=True,
+            )
+
+        predictions = metrics.get("predictions")
+        targets = metrics.get("targets")
+        if not isinstance(predictions, list) or not isinstance(targets, list):
+            raise RuntimeError("Evaluation did not return predictions/targets for reporting.")
+
+        evaluation = self._build_classification_report(
+            predictions=predictions,
+            targets=targets,
+            class_names=class_names,
+        )
+        evaluation.update(
+            {
+                "schema_version": 1,
+                "generated_at": self._timestamp_now(),
+                "experiment_name": self.config.experiment_name,
+                "checkpoint_path": str(checkpoint_source),
+                "split": split_name,
+                "loss": float(metrics["loss"]),
+                "device": self._resolve_device(),
+            }
+        )
+        report_path, confusion_path = self._write_evaluation_artifacts(evaluation)
+        summary = {
+            "checkpoint_path": str(checkpoint_source),
+            "evaluation_report_path": str(report_path),
+            "confusion_matrix_path": str(confusion_path),
+            "split": split_name,
+            "loss": float(metrics["loss"]),
+            "accuracy": float(evaluation["accuracy"]),
+            "macro_f1": float(evaluation["macro_f1"]),
+            "weighted_f1": float(evaluation["weighted_f1"]),
+            "num_samples": int(evaluation["num_samples"]),
+            "cache": cache_summary,
+        }
+        return summary
+
+    def export_onnx(
+        self,
+        *,
+        manifest_path: Path | None = None,
+        checkpoint_path: Path | None = None,
+        output_path: Path | None = None,
+    ) -> dict[str, Any]:
+        import onnx
+        import onnxruntime as ort
+        import torch
+
+        frame = (
+            self.load_manifest(manifest_path)
+            if (manifest_path or self.config.manifest_path.exists())
+            else None
+        )
+        checkpoint_source = (
+            checkpoint_path
+            or self.config.resume_from_checkpoint
+            or self._checkpoint_path()
+        )
+        payload = self._load_checkpoint_payload(checkpoint_source)
+        overrides = self._checkpoint_training_overrides(payload)
+        class_names = list(
+            payload.get("labels") or (self.class_names(frame) if frame is not None else [])
+        )
+        self._require_trainable_classes(class_names)
+        destination = output_path or self.config.onnx_output_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._temporary_config(**overrides):
+            model = self.build_model_stub(num_classes=len(class_names))
+            state_dict = payload.get("best_model_state_dict") or payload.get("model_state_dict")
+            if state_dict is None:
+                raise ValueError(f"Checkpoint has no model weights: {checkpoint_source}")
+            model.load_state_dict(state_dict)
+            model.eval()
+            model.cpu()
+
+            dummy_input = torch.randn(
+                self.config.export_batch_size,
+                3,
+                self.config.image_size,
+                self.config.image_size,
+                dtype=torch.float32,
+            )
+            with torch.inference_mode():
+                pytorch_logits = model(dummy_input).detach().cpu().numpy()
+
+            torch.onnx.export(
+                model,
+                dummy_input,
+                str(destination),
+                export_params=True,
+                do_constant_folding=True,
+                dynamo=False,
+                input_names=["images"],
+                output_names=["logits"],
+                dynamic_axes={
+                    "images": {0: "batch_size"},
+                    "logits": {0: "batch_size"},
+                },
+                opset_version=self.config.onnx_opset,
+            )
+
+            onnx_model = onnx.load(str(destination))
+            onnx.checker.check_model(onnx_model)
+
+            verification: dict[str, Any]
+            if self.config.verify_onnx:
+                session = ort.InferenceSession(
+                    str(destination),
+                    providers=["CPUExecutionProvider"],
+                )
+                input_name = session.get_inputs()[0].name
+                output_name = session.get_outputs()[0].name
+                onnx_logits = np.asarray(
+                    session.run(
+                        [output_name],
+                        {input_name: dummy_input.detach().cpu().numpy()},
+                    )[0]
+                )
+                max_abs_diff = float(np.max(np.abs(onnx_logits - pytorch_logits)))
+                if max_abs_diff > 1e-3:
+                    raise ValueError(
+                        "ONNX verification failed because PyTorch and ONNX outputs diverged "
+                        f"(max_abs_diff={max_abs_diff:.6f})."
+                    )
+                verification = {
+                    "verified": True,
+                    "provider": "CPUExecutionProvider",
+                    "input_name": input_name,
+                    "output_name": output_name,
+                    "max_abs_diff": max_abs_diff,
+                }
+            else:
+                verification = {"verified": False, "skipped": True}
+
+        labels_path = self._write_labels_payload(class_names)
+        export_summary = {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
+            "experiment_name": self.config.experiment_name,
+            "checkpoint_path": str(checkpoint_source),
+            "onnx_path": str(destination),
+            "labels_path": str(labels_path),
+            "model_name": str(overrides.get("model_name", self.config.model_name)),
+            "image_size": int(overrides.get("image_size", self.config.image_size)),
+            "normalization_preset": str(
+                overrides.get("normalization_preset", self.config.normalization_preset)
+            ),
+            "onnx_opset": self.config.onnx_opset,
+            "input_spec": {
+                "name": "images",
+                "dtype": "float32",
+                "shape": [
+                    self.config.export_batch_size,
+                    3,
+                    self.config.image_size,
+                    self.config.image_size,
+                ],
+                "dynamic_axes": {"0": "batch_size"},
+            },
+            "output_spec": {"name": "logits", "dtype": "float32"},
+            "num_classes": len(class_names),
+            "labels": class_names,
+            "verification": verification,
+        }
+        model_manifest = self._build_model_manifest(
+            export_summary=export_summary,
+            checkpoint_payload=payload,
+        )
+        self._write_json(self._export_report_path(), export_summary)
+        self._write_json(self._model_manifest_path(), model_manifest)
+        export_summary["export_report_path"] = str(self._export_report_path())
+        export_summary["model_manifest_path"] = str(self._model_manifest_path())
+        return export_summary
+
+    def build_artifact_report(self, manifest_path: Path | None = None) -> dict[str, Any]:
+        frame = (
+            self.load_manifest(manifest_path)
+            if (manifest_path or self.config.manifest_path.exists())
+            else None
+        )
+        report = {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
+            "experiment_name": self.config.experiment_name,
+            "training_plan": self.summarize_training_plan(manifest_frame=frame),
+            "dataset_summary": self._read_json(
+                self.paths.artifact_dir / "reports" / "summary.json"
+            ),
+            "training": self._read_json(self._training_report_path()),
+            "evaluation": self._read_json(self._evaluation_report_path()),
+            "export": self._read_json(self._export_report_path()),
+            "model_manifest": self._read_json(self._model_manifest_path()),
+        }
+        self._write_json(self._artifact_bundle_path(), report)
+        return report
+
     def fit(
         self,
         manifest_path: Path | None = None,
@@ -593,6 +878,7 @@ class WasteTrainer:
             raise RuntimeError("No labels available in manifest. Cannot train a classifier.")
 
         class_names = self.class_names(frame)
+        self._require_trainable_classes(class_names)
         model = self.build_model_stub(num_classes=len(label_to_index))
         device = self._resolve_device()
         print(f"Training on device: {device}")
@@ -771,11 +1057,15 @@ class WasteTrainer:
         labels_path = self.export_label_index(manifest_frame=frame)
 
         summary = {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
             "checkpoint_path": str(best_checkpoint_path),
             "best_checkpoint_path": str(best_checkpoint_path),
             "latest_checkpoint_path": str(latest_checkpoint_path),
             "training_preset": self.config.training_preset,
+            "experiment_name": self.config.experiment_name,
             "labels_path": str(labels_path),
+            "training_report_path": str(self._training_report_path()),
             "num_classes": len(label_to_index),
             "best_epoch": best_epoch,
             "best_loss": best_loss,
@@ -798,6 +1088,7 @@ class WasteTrainer:
         }
 
         if interrupted:
+            self._write_json(self._training_report_path(), summary)
             return summary
 
         model.load_state_dict(best_state_dict)
@@ -822,6 +1113,17 @@ class WasteTrainer:
                     predictions=predictions,
                     targets=targets,
                     class_names=class_names,
+                )
+                evaluation.update(
+                    {
+                        "schema_version": 1,
+                        "generated_at": self._timestamp_now(),
+                        "experiment_name": self.config.experiment_name,
+                        "checkpoint_path": str(best_checkpoint_path),
+                        "split": "test",
+                        "loss": float(test_metrics["loss"]),
+                        "device": device,
+                    }
                 )
                 report_path, confusion_path = self._write_evaluation_artifacts(evaluation)
                 evaluation_summary = {
@@ -851,6 +1153,7 @@ class WasteTrainer:
             evaluation_summary=evaluation_summary,
         )
 
+        self._write_json(self._training_report_path(), summary)
         return summary
 
     def warm_image_cache(
@@ -902,8 +1205,149 @@ class WasteTrainer:
             print(f"Rust cache failure report: {summary['failure_report_path']}")
         return summary
 
+    def _ensure_manifest_columns(self, frame: pl.DataFrame) -> pl.DataFrame:
+        result = frame
+        if "label_source" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != "unknown")
+                .then(pl.lit("filename"))
+                .otherwise(pl.lit("unknown"))
+                .alias("label_source")
+            )
+        if "annotation_status" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != "unknown")
+                .then(pl.lit("inferred"))
+                .otherwise(pl.lit("unlabeled"))
+                .alias("annotation_status")
+            )
+        if "annotated_at" not in result.columns:
+            result = result.with_columns(pl.lit(None, dtype=pl.String).alias("annotated_at"))
+        return result
+
     def _labeled_frame(self, manifest_frame: pl.DataFrame) -> pl.DataFrame:
-        return manifest_frame.filter(pl.col("is_valid") & (pl.col("label") != "unknown"))
+        frame = self._ensure_manifest_columns(manifest_frame)
+        return frame.filter(
+            pl.col("is_valid")
+            & (pl.col("label") != "unknown")
+            & pl.col("annotation_status").is_in(["inferred", "labeled"])
+        )
+
+    def _require_trainable_classes(self, class_names: list[str]) -> None:
+        if len(class_names) < 2:
+            raise RuntimeError(
+                "Training-ready manifest must contain at least 2 classes. "
+                f"Found {len(class_names)} class(es): {class_names}"
+            )
+
+    def _write_labels_payload(
+        self,
+        labels: list[str],
+        output_path: Path | None = None,
+    ) -> Path:
+        destination = output_path or self.config.labels_output_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(labels, indent=2), encoding="utf-8")
+        return destination
+
+    def _load_checkpoint_payload(self, checkpoint_path: Path) -> dict[str, Any]:
+        import torch
+
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint_path}")
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid checkpoint payload: {checkpoint_path}")
+        return payload
+
+    def _checkpoint_training_overrides(self, payload: dict[str, Any]) -> dict[str, Any]:
+        training_config = payload.get("training_config")
+        if not isinstance(training_config, dict):
+            training_config = {}
+        return {
+            "model_name": str(training_config.get("model_name", self.config.model_name)),
+            "image_size": int(training_config.get("image_size", self.config.image_size)),
+            "normalization_preset": str(
+                training_config.get("normalization_preset", self.config.normalization_preset)
+            ),
+            "cache_format": str(training_config.get("cache_format", self.config.cache_format)),
+        }
+
+    @contextmanager
+    def _temporary_config(self, **overrides: Any):
+        original_values = {
+            key: getattr(self.config, key)
+            for key, value in overrides.items()
+            if value is not None and hasattr(self.config, key)
+        }
+        for key, value in overrides.items():
+            if value is not None and hasattr(self.config, key):
+                setattr(self.config, key, value)
+        try:
+            yield
+        finally:
+            for key, value in original_values.items():
+                setattr(self.config, key, value)
+
+    def _evaluation_split_name(self, loaders: dict[str, Any]) -> str | None:
+        if "test" in loaders:
+            return "test"
+        if "val" in loaders:
+            return "val"
+        return None
+
+    def _build_model_manifest(
+        self,
+        *,
+        export_summary: dict[str, Any],
+        checkpoint_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        mean, std = normalization_stats(str(export_summary["normalization_preset"]))
+        evaluation_payload = self._read_json(self._evaluation_report_path())
+        evaluation_summary = checkpoint_payload.get("evaluation_summary")
+        if evaluation_summary is None and isinstance(evaluation_payload, dict):
+            evaluation_summary = {
+                "accuracy": evaluation_payload.get("accuracy"),
+                "macro_f1": evaluation_payload.get("macro_f1"),
+                "weighted_f1": evaluation_payload.get("weighted_f1"),
+            }
+        return {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
+            "experiment_name": self.config.experiment_name,
+            "model_name": export_summary["model_name"],
+            "onnx_path": export_summary["onnx_path"],
+            "labels_path": export_summary["labels_path"],
+            "checkpoint_path": export_summary["checkpoint_path"],
+            "labels": export_summary["labels"],
+            "image_size": export_summary["image_size"],
+            "normalization": {
+                "preset": export_summary["normalization_preset"],
+                "mean": list(mean),
+                "std": list(std),
+            },
+            "onnx": {
+                "opset": export_summary["onnx_opset"],
+                "input_spec": export_summary["input_spec"],
+                "output_spec": export_summary["output_spec"],
+                "verification": export_summary["verification"],
+            },
+            "evaluation_summary": evaluation_summary,
+        }
+
+    def _write_json(self, output_path: Path, payload: dict[str, Any]) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return output_path
+
+    def _read_json(self, path: Path) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+
+    def _timestamp_now(self) -> str:
+        return datetime.now(UTC).isoformat(timespec="seconds")
 
     def _resolve_device(self) -> str:
         import torch
@@ -931,6 +1375,18 @@ class WasteTrainer:
             / "reports"
             / f"{self.config.experiment_name}_confusion_matrix.csv"
         )
+
+    def _training_report_path(self) -> Path:
+        return self.paths.artifact_dir / "reports" / f"{self.config.experiment_name}_training.json"
+
+    def _export_report_path(self) -> Path:
+        return self.paths.artifact_dir / "reports" / f"{self.config.experiment_name}_export.json"
+
+    def _artifact_bundle_path(self) -> Path:
+        return self.paths.artifact_dir / "reports" / f"{self.config.experiment_name}_report.json"
+
+    def _model_manifest_path(self) -> Path:
+        return self.config.model_manifest_output_path
 
     def _cache_dir(self) -> Path:
         suffix = "" if self.config.cache_format == "png" else f"-{self.config.cache_format}"
