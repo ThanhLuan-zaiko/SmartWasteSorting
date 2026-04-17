@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,10 +50,14 @@ class RuntimeConfig:
 @dataclass(slots=True)
 class TrainingConfig:
     experiment_name: str = "baseline-waste-sorter"
+    model_name: str = "mobilenet_v3_small"
+    pretrained_backbone: bool = True
+    freeze_backbone: bool = True
     image_size: int = 224
     batch_size: int = 16
     epochs: int = 10
-    num_workers: int = 4
+    num_workers: int = 0 if sys.platform.startswith("win") else 4
+    prefetch_factor: int = 2
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     manifest_path: Path = field(
@@ -67,7 +72,16 @@ class TrainingConfig:
     checkpoint_dir: Path = field(
         default_factory=lambda: _project_root() / "artifacts" / "checkpoints"
     )
-    device: str = "cpu"
+    cache_dir: Path = field(
+        default_factory=lambda: _project_root() / "artifacts" / "cache" / "training"
+    )
+    use_rust_image_cache: bool = True
+    force_rebuild_cache: bool = False
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 1e-3
+    enable_early_stopping: bool = True
+    show_progress: bool = True
+    device: str = "auto"
 
 
 @dataclass(slots=True)
@@ -87,6 +101,7 @@ class DatasetPipelineConfig:
     hash_algorithm: str = "sha256"
     infer_labels_from_filename: bool = True
     unknown_label: str = "unknown"
+    show_progress: bool = True
 
     @property
     def manifest_path(self) -> Path:

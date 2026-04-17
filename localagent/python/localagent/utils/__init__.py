@@ -1,3 +1,4 @@
 from .logging import configure_logging
+from .progress import TerminalProgressBar
 
-__all__ = ["configure_logging"]
+__all__ = ["TerminalProgressBar", "configure_logging"]

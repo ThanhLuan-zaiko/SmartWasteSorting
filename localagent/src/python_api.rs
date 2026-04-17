@@ -1,6 +1,6 @@
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyModule, wrap_pyfunction, Bound};
 
-use crate::{RuntimeConfig, WasteClassifier};
+use crate::{training_cache::build_training_cache, RuntimeConfig, WasteClassifier};
 
 #[pyclass]
 pub struct RustBackend {
@@ -55,8 +55,35 @@ fn ping() -> &'static str {
     "localagent-rs-ready"
 }
 
+#[pyfunction]
+#[pyo3(signature = (entries, cache_dir, image_size, failure_report_path=None, force=false, show_progress=true))]
+fn prepare_image_cache(
+    py: Python<'_>,
+    entries: Vec<(String, String)>,
+    cache_dir: String,
+    image_size: u32,
+    failure_report_path: Option<String>,
+    force: bool,
+    show_progress: bool,
+) -> PyResult<String> {
+    py.allow_threads(move || {
+        let summary = build_training_cache(
+            &entries,
+            std::path::Path::new(&cache_dir),
+            failure_report_path.as_deref().map(std::path::Path::new),
+            image_size,
+            force,
+            show_progress,
+        )
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+
+        serde_json::to_string(&summary).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    })
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RustBackend>()?;
     module.add_function(wrap_pyfunction!(ping, module)?)?;
+    module.add_function(wrap_pyfunction!(prepare_image_cache, module)?)?;
     Ok(())
 }

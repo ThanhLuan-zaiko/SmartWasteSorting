@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import import_module
 from typing import Any
 
 from localagent.config import RuntimeConfig
 
-
-def _load_extension() -> Any | None:
-    try:
-        return import_module("localagent._rust")
-    except ImportError:
-        return None
+from ._extension import load_extension
 
 
 @dataclass(slots=True)
@@ -19,10 +13,10 @@ class RustBackendBridge:
     config: RuntimeConfig
 
     def is_available(self) -> bool:
-        return _load_extension() is not None
+        return load_extension() is not None
 
     def create_backend(self) -> Any | None:
-        extension = _load_extension()
+        extension = load_extension()
         if extension is None:
             return None
         return extension.RustBackend(
@@ -33,7 +27,7 @@ class RustBackendBridge:
         )
 
     def ping(self) -> str | None:
-        extension = _load_extension()
+        extension = load_extension()
         if extension is None:
             return None
         return extension.ping()

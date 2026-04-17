@@ -14,6 +14,7 @@ import numpy as np
 import polars as pl
 
 from localagent.config import DatasetPipelineConfig
+from localagent.utils import TerminalProgressBar
 
 MANIFEST_SCHEMA: dict[str, pl.DataType] = {
     "sample_id": pl.String,
@@ -46,7 +47,18 @@ class DatasetPipeline:
         self.config = (config or DatasetPipelineConfig()).validate().ensure_layout()
 
     def scan(self) -> pl.DataFrame:
-        records = [self._inspect_image(image_path) for image_path in self._iter_image_paths()]
+        image_paths = self._iter_image_paths()
+        progress = TerminalProgressBar(
+            total=len(image_paths),
+            description="scan dataset",
+            enabled=self.config.show_progress,
+        )
+        records: list[dict[str, Any]] = []
+        for image_path in image_paths:
+            records.append(self._inspect_image(image_path))
+            progress.advance(postfix=image_path.name)
+        progress.close(summary=f"Scanned {len(records)} images from {self.config.raw_dataset_dir}")
+
         self._mark_duplicates(records)
         for record in records:
             self._apply_quality_flags(record)
@@ -366,6 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     common_parent.add_argument("--val-ratio", type=float, default=None)
     common_parent.add_argument("--test-ratio", type=float, default=None)
     common_parent.add_argument("--seed", type=int, default=None)
+    common_parent.add_argument("--no-progress", action="store_true")
 
     for command in ("scan", "split", "report", "run-all"):
         subparsers.add_parser(command, parents=[common_parent])
@@ -389,6 +402,9 @@ def build_config(args: argparse.Namespace) -> DatasetPipelineConfig:
         random_seed=defaults.random_seed if args.seed is None else args.seed,
         allowed_extensions=defaults.allowed_extensions,
         hash_algorithm=defaults.hash_algorithm,
+        infer_labels_from_filename=defaults.infer_labels_from_filename,
+        unknown_label=defaults.unknown_label,
+        show_progress=not args.no_progress,
     )
 
 

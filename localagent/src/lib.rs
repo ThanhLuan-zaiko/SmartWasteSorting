@@ -4,6 +4,7 @@ mod error;
 mod inference;
 mod python_api;
 mod telemetry;
+mod training_cache;
 
 pub use config::RuntimeConfig;
 pub use domain::{ClassificationResult, Prediction};

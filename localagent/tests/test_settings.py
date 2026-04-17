@@ -38,8 +38,11 @@ def test_runtime_and_training_defaults_are_stable() -> None:
 
     assert runtime.server_port == 8080
     assert runtime.base_url == "http://127.0.0.1:8080"
+    assert training.model_name == "mobilenet_v3_small"
+    assert training.pretrained_backbone is True
     assert training.batch_size == 16
     assert training.image_size == 224
+    assert training.enable_early_stopping is True
     assert training.manifest_path.name == "dataset_manifest.parquet"
     assert training.labels_output_path.name == "labels.json"
 

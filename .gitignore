@@ -71,6 +71,7 @@ logs/**/*.log
 *.bin
 *.safetensors
 *.pdb
+localagent/models/labels.json
 
 # Local datasets
 localagent/dataset/
@@ -81,3 +82,5 @@ localagent/artifacts/manifests/*
 !localagent/artifacts/manifests/.gitkeep
 localagent/artifacts/reports/*
 !localagent/artifacts/reports/.gitkeep
+localagent/artifacts/cache/*
+!localagent/artifacts/cache/.gitkeep
