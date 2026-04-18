@@ -163,12 +163,90 @@ Server hiện đã đọc được các JSON artifact của trainer để trả 
 - `GET /artifacts/experiment-spec`
 - `GET /artifacts/model-manifest`
 
-## Hai pipeline chính
+## Ba tầng pipeline chính
 
-Hiện tại `localagent` xoay quanh 2 pipeline chạy nối tiếp nhau:
+Hiện tại `localagent` vận hành theo 3 tầng nối tiếp nhau:
 
-1. Pipeline dữ liệu: quét ảnh thô, làm sạch, suy nhãn, chia `train/val/test`, sinh manifest và báo cáo.
-2. Pipeline huấn luyện: đọc manifest, warm cache ảnh bằng Rust, dựng `DataLoader`, huấn luyện baseline và ghi checkpoint.
+1. Pipeline dữ liệu: quét ảnh thô, làm sạch, suy nhãn yếu từ tên file, chia `train/val/test`, sinh manifest và báo cáo.
+2. Pipeline discovery: trích embedding, gom cụm ảnh tương tự, export review template và nhận nhãn chấp nhận từ người dùng theo cụm.
+3. Pipeline huấn luyện: đọc manifest đã được curate, warm cache ảnh bằng Rust, dựng `DataLoader`, huấn luyện supervised baseline, rồi mở rộng bằng pseudo-label nếu cần.
+
+### Sơ đồ ASCII
+
+```text
+localagent/dataset/
+        |
+        v
+  run-all
+  scan -> quality flags -> weak labels -> split
+        |
+        v
+  dataset_manifest.parquet + summary.json
+        |
+        +------------------------------+
+        |                              |
+        v                              v
+      embed                        import-labels
+        |                              |
+        v                              |
+     cluster                           |
+        |                              |
+        v                              |
+  export-cluster-review                |
+        |                              |
+        v                              |
+   human review -----------------------+
+        |
+        v
+  promote-cluster-labels
+        |
+        v
+ accepted_labels_only manifest
+        |
+        v
+ summary -> warm-cache -> fit -> evaluate/export/report
+                         |
+                         v
+                    pseudo-label
+                         |
+                         v
+                 accepted pseudo labels
+                         |
+                         +------> update manifest
+```
+
+### Sơ đồ Mermaid
+
+```mermaid
+flowchart TD
+    A[dataset/] --> B[run-all<br/>scan + split + report]
+    B --> C[dataset manifest<br/>summary.json]
+    C --> D[embed<br/>image embeddings]
+    D --> E[cluster<br/>cluster id + outliers]
+    E --> F[export-cluster-review]
+    F --> G[human review]
+    C --> H[import-labels]
+    G --> I[promote-cluster-labels]
+    H --> I
+    I --> J[accepted_labels_only manifest]
+    J --> K[summary]
+    K --> L[warm-cache<br/>Rust image cache]
+    L --> M[fit<br/>supervised transfer learning]
+    M --> N[pseudo-label<br/>confidence + margin gate]
+    N --> J
+    M --> O[evaluate]
+    M --> P[export-onnx / export-spec]
+    M --> Q[benchmark / report]
+```
+
+### Legend nhãn
+
+| Label type | Ý nghĩa | Dùng để train |
+| --- | --- | --- |
+| `weak label` | Nhãn yếu suy từ tên file hoặc cấu trúc tên ảnh; dùng làm tín hiệu khởi đầu khi chưa có curate labels. | Chỉ dùng tạm thời trước khi có accepted labels |
+| `curated` | Nhãn đã được con người gán hoặc xác nhận trực tiếp qua import labels. | Có |
+| `cluster_review` | Nhãn được người dùng chấp nhận ở mức cụm sau bước `embed -> cluster -> review`. | Có |
+| `model_pseudo` | Nhãn do model đề xuất và chỉ được nhận khi vượt ngưỡng `confidence` và `margin`. | Có, nếu đã được accept qua pseudo-label gate |
 
 Luồng chuẩn để test end-to-end là:
 
@@ -177,12 +255,18 @@ cd localagent
 uv sync --dev
 uv run maturin develop
 uv run python -m localagent.data.pipeline run-all
+uv run python -m localagent.data.pipeline embed
+uv run python -m localagent.data.pipeline cluster
+uv run python -m localagent.data.pipeline export-cluster-review
+# edit artifacts/manifests/cluster_review.csv before promoting labels
+uv run python -m localagent.data.pipeline promote-cluster-labels --review-file artifacts/manifests/cluster_review.csv
 uv run python -m localagent.data.pipeline export-labeling-template
 uv run python -m localagent.data.pipeline import-labels --labels-file artifacts/manifests/labeling_template.csv
 uv run python -m localagent.data.pipeline validate-labels
 uv run python -m localagent.training.train summary
 uv run python -m localagent.training.train warm-cache
 uv run python -m localagent.training.train fit
+uv run python -m localagent.training.train pseudo-label
 uv run python -m localagent.training.train evaluate
 uv run python -m localagent.training.train export-onnx
 uv run python -m localagent.training.train export-spec
@@ -472,9 +556,9 @@ Lệnh trên giúp bạn xác minh:
 - Nếu `warm-cache` báo có lỗi, trainer sẽ tự thử cứu tiếp bằng OpenCV. Chỉ các ảnh còn lỗi sau bước fallback này mới ở lại trong `training_cache_failures_<image_size>px.json`.
 - Khi chạy `fit`, CLI có thể in progress bar khá liên tục ở từng batch. Đây là hành vi mong đợi, không phải lỗi.
 - Nếu bạn chỉ muốn xác minh pipeline hoạt động, hãy giảm `image_size` và `epochs` trước. Đừng chạy cấu hình nặng ngay trên CPU.
-- Dataset chỉ train tốt khi pipeline suy nhãn được từ tên file. Nếu tên file không mang cấu trúc kiểu `label_123.jpg`, nhiều mẫu có thể rơi vào `label=unknown` hoặc `split=excluded`.
+- Nếu tên file không đủ rõ để suy nhãn, đừng dừng ở `run-all`. Hãy dùng thêm `embed`, `cluster`, `export-cluster-review`, `promote-cluster-labels` hoặc `import-labels` để chuyển manifest sang nhãn đã được chấp nhận.
 - Ảnh lỗi, ảnh trùng và ảnh quá nhỏ không bị di chuyển khỏi dữ liệu gốc. Chúng chỉ bị đánh dấu trong manifest và bị loại khỏi tập train.
-- `run-all` chỉ chuẩn hóa dữ liệu và sinh báo cáo. Nó không train mô hình. Sau `run-all`, bạn vẫn cần chạy `summary`, `warm-cache`, rồi mới `fit`.
+- `run-all` chỉ chuẩn hóa dữ liệu và sinh báo cáo. Nó không train mô hình. Sau `run-all`, nếu nhãn còn yếu thì nên đi qua discovery/curation trước khi `summary`, `warm-cache` và `fit`.
 - Nếu bạn đổi `--image-size`, hệ thống sẽ tạo một nhánh cache mới tương ứng. Ví dụ `160px` và `224px` là hai bộ cache tách biệt.
 - Trên Windows, `num_workers=0` thường ổn định hơn cho bước test nhanh đầu tiên. Sau khi xác nhận pipeline chạy đúng, bạn mới nên thử tăng `num_workers`.
 
@@ -492,6 +576,51 @@ Nó không thay thế GPU cho phần toán tử học sâu. Nếu vẫn thấy c
 - giảm `epochs`
 - tăng hoặc giảm `batch_size` tùy RAM
 - dùng GPU/CUDA nếu có
+
+## Workflow bán giám sát và giá trị học thuật
+
+Phiên bản hiện tại không còn coi bài toán là "chỉ train từ tên file". Về mặt học thuật, pipeline đang kết hợp 3 nguồn tín hiệu:
+
+- `weak supervision`: tên file được dùng như nhãn yếu ban đầu nếu dataset chưa có curate labels.
+- `unsupervised / representation-driven discovery`: ảnh được đưa qua bước `embed` để lấy vector đặc trưng thị giác, sau đó `cluster` để gom các ảnh gần nhau trong không gian embedding.
+- `supervised learning`: chỉ khi đã có đủ nhãn chấp nhận được thì `fit` mới huấn luyện classifier thực sự.
+
+Luồng discovery hiện tại:
+
+1. `run-all` tạo manifest trung tâm, ghi rõ `raw_label`, `label_source`, `annotation_status`, `review_status` và các cờ chất lượng dữ liệu.
+2. `embed` trích embedding bằng backbone pretrained để xây không gian biểu diễn; nếu môi trường không dùng được extractor pretrained thì pipeline có fallback an toàn sang đặc trưng thị giác thủ công.
+3. `cluster` chạy gom cụm trên embedding đã chuẩn hóa để sinh `cluster_id`, `cluster_distance`, `cluster_size`, `is_cluster_outlier`.
+4. `export-cluster-review` xuất template review theo cụm, giúp người dùng gán nhãn ở mức cluster thay vì từng ảnh.
+5. `promote-cluster-labels` đưa nhãn được chấp nhận từ review quay lại manifest. Sau thời điểm này hệ thống chuyển sang `accepted_labels_only`, nghĩa là nhãn suy từ filename chỉ còn là gợi ý yếu chứ không còn là ground truth cho train.
+6. `pseudo-label` cho phép mở rộng tập nhãn bằng model hiện tại, nhưng chỉ nhận các mẫu vượt ngưỡng `confidence` và `margin`, nhờ đó giữ được ranh giới giữa mẫu chắc chắn và mẫu cần review tiếp.
+
+Điểm quan trọng về mặt nghiên cứu là manifest không chỉ lưu "một nhãn cuối cùng", mà lưu cả provenance của nhãn:
+
+- `curated_label`: nhãn đã được con người xác nhận
+- `suggested_label`: nhãn gợi ý từ cluster review hoặc model
+- `label_source`: nguồn nhãn đang được dùng để train
+- `pseudo_label_score` và `pseudo_label_margin`: độ tin cậy của pseudo-label
+
+Thiết kế này giúp phân biệt rõ dữ liệu chắc chắn và dữ liệu còn yếu, từ đó phù hợp hơn với các bài toán thực tế nơi ảnh rác ban đầu có tên file mơ hồ như `R_1.jpg`.
+
+## Kỹ thuật huấn luyện mô hình
+
+Phần train hiện tại theo hướng transfer learning thực dụng, đủ chắc cho baseline nghiên cứu nhưng vẫn nhẹ để chạy cục bộ:
+
+- Backbones hỗ trợ gồm `mobilenet_v3_small`, `mobilenet_v3_large`, `resnet18`, `efficientnet_b0`.
+- Mặc định trainer ưu tiên pretrained weights kiểu ImageNet và freeze backbone để giảm chi phí học trên CPU; có thể bật `--train-backbone` khi muốn fine-tune toàn bộ.
+- Dữ liệu train được đọc từ manifest thay vì ép phải tổ chức thư mục `train/val/test`, giúp kiểm soát provenance nhãn tốt hơn.
+- Mất cân bằng lớp được xử lý bằng `class_bias=loss`, `class_bias=sampler` hoặc `class_bias=both`.
+- `warm-cache` dùng Rust để giảm chi phí decode và resize lặp lại qua nhiều epoch, còn forward/backward và optimizer vẫn do PyTorch đảm nhiệm.
+- Early stopping theo validation loss, checkpoint `best` và `latest`, resume training, đánh giá độc lập, export ONNX, benchmark compare đều là một phần của cùng pipeline thực nghiệm.
+
+Về bản chất, đây là một pipeline hybrid:
+
+- không giám sát hoàn toàn: vì clustering chỉ dùng để tổ chức dữ liệu và hỗ trợ annotation
+- không giám sát thuần túy: vì classifier cuối cùng vẫn học có giám sát từ các nhãn đã được chấp nhận
+- bán giám sát: vì pseudo-label cho phép mở rộng tập train từ một seed set nhỏ nhưng vẫn có ngưỡng kiểm soát độ tin cậy
+
+Trong build hiện tại, `pytorch` là backend huấn luyện thực thi thật. `rust_tch` mới dừng ở mức preview cho contract benchmark/spec, chưa thay thế phần lõi học sâu.
 
 ## Cách chạy `interface`
 
@@ -540,16 +669,18 @@ Các file lock quan trọng vẫn được giữ lại:
 4. Chạy `uv run maturin develop`.
 5. Đặt ảnh thô vào `localagent/dataset/`.
 6. Chạy `uv run python -m localagent.data.pipeline run-all`.
-7. Kiểm tra manifest và các báo cáo.
-8. Chạy `uv run python -m localagent.training.train summary`.
-9. Chạy `uv run python -m localagent.training.train warm-cache`.
-10. Chạy `uv run python -m localagent.training.train fit`.
+7. Nếu tên file mơ hồ, chạy tiếp `embed`, `cluster`, `export-cluster-review`, review cụm và `promote-cluster-labels`.
+8. Kiểm tra manifest, `summary.json` và số lớp train-ready.
+9. Chạy `uv run python -m localagent.training.train summary`.
+10. Chạy `uv run python -m localagent.training.train warm-cache`.
+11. Chạy `uv run python -m localagent.training.train fit`.
+12. Nếu muốn mở rộng seed set, chạy `uv run python -m localagent.training.train pseudo-label` rồi huấn luyện/evaluate lại.
 
 ## Ghi chú hiện trạng
 
 - `localagent/` là phần vận hành chính hiện tại.
-- `interface/` vẫn là phần mẫu.
+- `interface/` đã là control panel chạy jobs, xem logs, preview cluster và đọc artifact qua Actix.
 - Pipeline dữ liệu ưu tiên an toàn dữ liệu gốc: chỉ đọc, phân tích, đánh dấu và xuất manifest/report.
-- Huấn luyện hiện là baseline đầu tiên để xác nhận flow ảnh thô → manifest → split → DataLoader → checkpoint.
+- Huấn luyện hiện là baseline nghiên cứu theo flow ảnh thô → manifest → discovery/curation → DataLoader → checkpoint.
 - Rust đang được dùng theo hướng bổ trợ thực dụng cho hiệu năng và CLI, không thay thế hoàn toàn phần train tensor của PyTorch.
 - Nếu bạn thấy train lâu bất thường, hãy kiểm tra lần lượt: `resolved_device`, kích thước ảnh, số epoch, batch size, số mẫu hợp lệ trong manifest và trạng thái cache ảnh.

@@ -14,7 +14,7 @@ import numpy as np
 import polars as pl
 
 from localagent.bridge import RustAccelerationBridge
-from localagent.config import AgentPaths, TrainingConfig
+from localagent.config import AgentPaths, DatasetPipelineConfig, TrainingConfig
 from localagent.data import DatasetIndex
 from localagent.training.benchmarking import (
     ExperimentSpec,
@@ -24,7 +24,7 @@ from localagent.training.benchmarking import (
 )
 from localagent.training.manifest_dataset import ManifestImageDataset
 from localagent.utils import TerminalProgressBar
-from localagent.vision import normalization_stats
+from localagent.vision import build_training_transforms, load_rgb_image, normalization_stats
 
 SUPPORTED_CNN_MODELS = (
     "mobilenet_v3_small",
@@ -32,6 +32,9 @@ SUPPORTED_CNN_MODELS = (
     "resnet18",
     "efficientnet_b0",
 )
+
+ACCEPTED_LABEL_SOURCES = {"curated", "cluster_review", "model_pseudo"}
+ACCEPTED_ANNOTATION_STATUSES = {"labeled", "pseudo_labeled"}
 
 
 class WasteTrainer:
@@ -90,6 +93,8 @@ class WasteTrainer:
             "early_stopping_patience": self.config.early_stopping_patience,
             "early_stopping_min_delta": self.config.early_stopping_min_delta,
             "enable_early_stopping": self.config.enable_early_stopping,
+            "pseudo_label_confidence_threshold": self.config.pseudo_label_confidence_threshold,
+            "pseudo_label_margin_threshold": self.config.pseudo_label_margin_threshold,
             "backend_capability": self._training_backend_capability(),
         }
         frame = manifest_frame
@@ -113,6 +118,7 @@ class WasteTrainer:
                     "split_counts": split_counts,
                     "train_label_counts": self.train_label_counts(frame),
                     "train_imbalance_ratio": self.train_imbalance_ratio(frame),
+                    "effective_training_mode": self._effective_training_mode(frame),
                 }
             )
             if self.config.class_bias_strategy != "none":
@@ -521,7 +527,7 @@ class WasteTrainer:
                 f"{checkpoint_path}"
             )
 
-        model_state_dict = payload.get("model_state_dict") or payload.get("best_model_state_dict")
+        model_state_dict = self._checkpoint_state_dict(payload, checkpoint_path=checkpoint_path)
         if model_state_dict is None:
             raise ValueError(f"Checkpoint has no model_state_dict: {checkpoint_path}")
         model.load_state_dict(model_state_dict)
@@ -892,7 +898,7 @@ class WasteTrainer:
                 raise RuntimeError("Evaluation requires a non-empty test or validation split.")
 
             model = self.build_model_stub(num_classes=len(class_names))
-            state_dict = payload.get("best_model_state_dict") or payload.get("model_state_dict")
+            state_dict = self._checkpoint_state_dict(payload, checkpoint_path=checkpoint_source)
             if state_dict is None:
                 raise ValueError(f"Checkpoint has no model weights: {checkpoint_source}")
             model.load_state_dict(state_dict)
@@ -983,7 +989,7 @@ class WasteTrainer:
 
         with self._temporary_config(**overrides):
             model = self.build_model_stub(num_classes=len(class_names))
-            state_dict = payload.get("best_model_state_dict") or payload.get("model_state_dict")
+            state_dict = self._checkpoint_state_dict(payload, checkpoint_path=checkpoint_source)
             if state_dict is None:
                 raise ValueError(f"Checkpoint has no model weights: {checkpoint_source}")
             model.load_state_dict(state_dict)
@@ -1106,6 +1112,7 @@ class WasteTrainer:
             "dataset_summary": self._read_json(
                 self.paths.artifact_dir / "reports" / "summary.json"
             ),
+            "pseudo_label": self._read_json(self._pseudo_label_report_path()),
             "training": self._read_json(self._training_report_path()),
             "evaluation": self._read_json(self._evaluation_report_path()),
             "export": self._read_json(self._export_report_path()),
@@ -1115,6 +1122,150 @@ class WasteTrainer:
         }
         self._write_json(self._artifact_bundle_path(), report)
         return report
+
+    def pseudo_label(
+        self,
+        *,
+        manifest_path: Path | None = None,
+        checkpoint_path: Path | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_training_backend_supported(operation="pseudo-label")
+        import torch
+
+        frame = self.load_manifest(manifest_path)
+        checkpoint_source = (
+            checkpoint_path
+            or self.config.resume_from_checkpoint
+            or self._checkpoint_path()
+        )
+        payload = self._load_checkpoint_payload(checkpoint_source)
+        overrides = self._checkpoint_training_overrides(payload)
+        class_names = list(payload.get("labels") or self.class_names(frame))
+        self._require_trainable_classes(class_names)
+        candidates = list(self._pseudo_label_candidates(frame).iter_rows(named=True))
+
+        summary: dict[str, Any] = {
+            "schema_version": 1,
+            "generated_at": self._timestamp_now(),
+            "experiment_name": self.config.experiment_name,
+            "training_backend": self.config.training_backend,
+            "manifest_path": str(self.config.manifest_path),
+            "checkpoint_path": str(checkpoint_source),
+            "candidate_count": len(candidates),
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "confidence_threshold": self.config.pseudo_label_confidence_threshold,
+            "margin_threshold": self.config.pseudo_label_margin_threshold,
+            "pseudo_label_report_path": str(self._pseudo_label_report_path()),
+        }
+        if not candidates:
+            self._write_json(self._pseudo_label_report_path(), summary)
+            return summary
+
+        assignments: dict[str, dict[str, Any]] = {}
+        accepted_scores: list[float] = []
+        with self._temporary_config(**overrides):
+            model = self.build_model_stub(num_classes=len(class_names))
+            state_dict = self._checkpoint_state_dict(payload, checkpoint_path=checkpoint_source)
+            if state_dict is None:
+                raise ValueError(f"Checkpoint has no model weights: {checkpoint_source}")
+            model.load_state_dict(state_dict)
+            device = self._resolve_device()
+            model.to(device)
+            model.eval()
+            transform = build_training_transforms(
+                self.config.image_size,
+                normalization_preset=self.config.normalization_preset,
+            )
+            progress = TerminalProgressBar(
+                total=len(candidates),
+                description="pseudo label",
+                enabled=self.config.show_progress,
+            )
+            for row in candidates:
+                image = load_rgb_image(Path(str(row["image_path"])))
+                tensor = transform(image).unsqueeze(0).to(device)
+                with torch.inference_mode():
+                    probabilities = torch.softmax(model(tensor), dim=1)[0].detach().cpu().numpy()
+                ranking = np.argsort(probabilities)[::-1]
+                top1_index = int(ranking[0])
+                top2_score = float(probabilities[int(ranking[1])]) if ranking.size > 1 else 0.0
+                score = float(probabilities[top1_index])
+                margin = float(score - top2_score)
+                predicted_label = str(class_names[top1_index])
+                accepted = (
+                    score >= self.config.pseudo_label_confidence_threshold
+                    and margin >= self.config.pseudo_label_margin_threshold
+                )
+                if accepted:
+                    accepted_scores.append(score)
+                assignments[str(row["sample_id"])] = {
+                    "predicted_label": predicted_label,
+                    "score": score,
+                    "margin": margin,
+                    "accepted": accepted,
+                }
+                progress.advance(postfix=str(row["file_name"]))
+            progress.close(
+                summary=(
+                    "Pseudo-label summary: "
+                    f"accepted={sum(1 for value in assignments.values() if value['accepted'])}, "
+                    f"rejected={sum(1 for value in assignments.values() if not value['accepted'])}"
+                )
+            )
+
+        updated_records: list[dict[str, Any]] = []
+        accepted_count = 0
+        rejected_count = 0
+        for row in frame.iter_rows(named=True):
+            record = dict(row)
+            assignment = assignments.get(str(record["sample_id"]))
+            if assignment is None:
+                updated_records.append(record)
+                continue
+            if bool(assignment["accepted"]):
+                accepted_count += 1
+                updated_records.append(
+                    self._apply_manifest_label_update(
+                        record,
+                        label=str(assignment["predicted_label"]),
+                        status="pseudo_labeled",
+                        label_source="model_pseudo",
+                        review_status="pseudo_accepted",
+                        suggested_label=str(assignment["predicted_label"]),
+                        suggested_label_source="model_pseudo",
+                        pseudo_label_score=float(assignment["score"]),
+                        pseudo_label_margin=float(assignment["margin"]),
+                    )
+                )
+                continue
+            rejected_count += 1
+            record["suggested_label"] = str(assignment["predicted_label"])
+            record["suggested_label_source"] = "model_pseudo"
+            record["pseudo_label_score"] = float(assignment["score"])
+            record["pseudo_label_margin"] = float(assignment["margin"])
+            record["review_status"] = "pseudo_rejected"
+            updated_records.append(record)
+
+        pipeline = self._dataset_pipeline()
+        updated_frame = pipeline.assign_splits(pipeline._frame_from_records(updated_records))
+        pipeline.write_manifest(updated_frame)
+        report_summary = pipeline.generate_reports(updated_frame)
+        summary.update(
+            {
+                "accepted_count": accepted_count,
+                "rejected_count": rejected_count,
+                "average_accepted_score": (
+                    float(sum(accepted_scores) / len(accepted_scores))
+                    if accepted_scores
+                    else None
+                ),
+                "training_ready_files": int(report_summary["training_ready_files"]),
+                "effective_training_mode": report_summary.get("effective_training_mode"),
+            }
+        )
+        self._write_json(self._pseudo_label_report_path(), summary)
+        return summary
 
     def fit(
         self,
@@ -1466,6 +1617,24 @@ class WasteTrainer:
 
     def _ensure_manifest_columns(self, frame: pl.DataFrame) -> pl.DataFrame:
         result = frame
+        if "raw_label" not in result.columns:
+            result = result.with_columns(pl.col("label").alias("raw_label"))
+        if "curated_label" not in result.columns:
+            result = result.with_columns(pl.lit(None, dtype=pl.String).alias("curated_label"))
+        if "suggested_label" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != "unknown")
+                .then(pl.col("label"))
+                .otherwise(pl.lit(None, dtype=pl.String))
+                .alias("suggested_label")
+            )
+        if "suggested_label_source" not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("label") != "unknown")
+                .then(pl.lit("filename"))
+                .otherwise(pl.lit(None, dtype=pl.String))
+                .alias("suggested_label_source")
+            )
         if "label_source" not in result.columns:
             result = result.with_columns(
                 pl.when(pl.col("label") != "unknown")
@@ -1482,22 +1651,110 @@ class WasteTrainer:
             )
         if "annotated_at" not in result.columns:
             result = result.with_columns(pl.lit(None, dtype=pl.String).alias("annotated_at"))
+        if "pseudo_label_score" not in result.columns:
+            result = result.with_columns(
+                pl.lit(None, dtype=pl.Float64).alias("pseudo_label_score")
+            )
+        if "pseudo_label_margin" not in result.columns:
+            result = result.with_columns(
+                pl.lit(None, dtype=pl.Float64).alias("pseudo_label_margin")
+            )
+        if "review_status" not in result.columns:
+            result = result.with_columns(pl.lit("unreviewed").alias("review_status"))
         return result
 
     def _labeled_frame(self, manifest_frame: pl.DataFrame) -> pl.DataFrame:
         frame = self._ensure_manifest_columns(manifest_frame)
-        return frame.filter(
+        base_filter = (
             pl.col("is_valid")
             & (pl.col("label") != "unknown")
-            & pl.col("annotation_status").is_in(["inferred", "labeled"])
+            & pl.col("annotation_status").is_in(["inferred", "labeled", "pseudo_labeled"])
         )
+        if self._has_accepted_labels(frame):
+            return frame.filter(
+                base_filter
+                & pl.col("label_source").is_in(sorted(ACCEPTED_LABEL_SOURCES))
+                & pl.col("annotation_status").is_in(sorted(ACCEPTED_ANNOTATION_STATUSES))
+            )
+        return frame.filter(base_filter)
 
     def _require_trainable_classes(self, class_names: list[str]) -> None:
         if len(class_names) < 2:
             raise RuntimeError(
                 "Training-ready manifest must contain at least 2 classes. "
-                f"Found {len(class_names)} class(es): {class_names}"
+                f"Found {len(class_names)} class(es): {class_names}. "
+                "If your filenames only infer one label, export the labeling template "
+                "and import curated labels first."
             )
+
+    def _has_accepted_labels(self, manifest_frame: pl.DataFrame) -> bool:
+        frame = self._ensure_manifest_columns(manifest_frame)
+        return (
+            frame.filter(
+                pl.col("is_valid")
+                & (pl.col("label") != "unknown")
+                & pl.col("label_source").is_in(sorted(ACCEPTED_LABEL_SOURCES))
+                & pl.col("annotation_status").is_in(sorted(ACCEPTED_ANNOTATION_STATUSES))
+            ).height
+            > 0
+        )
+
+    def _effective_training_mode(self, manifest_frame: pl.DataFrame) -> str:
+        return (
+            "accepted_labels_only"
+            if self._has_accepted_labels(manifest_frame)
+            else "weak_inferred"
+        )
+
+    def _pseudo_label_candidates(self, manifest_frame: pl.DataFrame) -> pl.DataFrame:
+        frame = self._ensure_manifest_columns(manifest_frame)
+        return frame.filter(
+            pl.col("is_valid")
+            & pl.col("label_source").is_in(["unknown", "filename"])
+            & ~pl.col("annotation_status").is_in(["excluded", "labeled", "pseudo_labeled"])
+        )
+
+    def _apply_manifest_label_update(
+        self,
+        record: dict[str, Any],
+        *,
+        label: str,
+        status: str,
+        label_source: str,
+        review_status: str,
+        suggested_label: str | None,
+        suggested_label_source: str | None,
+        pseudo_label_score: float | None = None,
+        pseudo_label_margin: float | None = None,
+    ) -> dict[str, Any]:
+        next_record = dict(record)
+        next_record["label"] = label if label else "unknown"
+        next_record["label_source"] = label_source if label else "unknown"
+        next_record["annotation_status"] = status
+        next_record["annotated_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        next_record["suggested_label"] = suggested_label
+        next_record["suggested_label_source"] = suggested_label_source
+        next_record["review_status"] = review_status
+        next_record["pseudo_label_score"] = pseudo_label_score
+        next_record["pseudo_label_margin"] = pseudo_label_margin
+        return next_record
+
+    def _dataset_pipeline(self):
+        from localagent.data import DatasetPipeline
+
+        return DatasetPipeline(
+            DatasetPipelineConfig(
+                raw_dataset_dir=self.paths.project_root / "dataset",
+                manifest_dir=self.config.manifest_path.parent,
+                report_dir=self.paths.artifact_dir / "reports",
+                manifest_name=self.config.manifest_path.name,
+                manifest_csv_name=f"{self.config.manifest_path.stem}.csv",
+                labeling_template_name=DatasetPipelineConfig().labeling_template_name,
+                cluster_review_template_name=DatasetPipelineConfig().cluster_review_template_name,
+                embeddings_name=DatasetPipelineConfig().embeddings_name,
+                show_progress=self.config.show_progress,
+            )
+        )
 
     def _write_labels_payload(
         self,
@@ -1518,6 +1775,22 @@ class WasteTrainer:
         if not isinstance(payload, dict):
             raise ValueError(f"Invalid checkpoint payload: {checkpoint_path}")
         return payload
+
+    def _checkpoint_state_dict(
+        self,
+        payload: dict[str, Any],
+        *,
+        checkpoint_path: Path,
+    ) -> dict[str, Any] | None:
+        if "best_model_state_dict" in payload:
+            state_dict = payload["best_model_state_dict"]
+            if state_dict is not None:
+                return state_dict
+        if "model_state_dict" in payload:
+            state_dict = payload["model_state_dict"]
+            if state_dict is not None:
+                return state_dict
+        return None
 
     def _checkpoint_training_overrides(self, payload: dict[str, Any]) -> dict[str, Any]:
         training_config = payload.get("training_config")
@@ -1650,6 +1923,13 @@ class WasteTrainer:
             self.paths.artifact_dir
             / "reports"
             / f"{self.config.experiment_name}_benchmark.json"
+        )
+
+    def _pseudo_label_report_path(self) -> Path:
+        return (
+            self.paths.artifact_dir
+            / "reports"
+            / f"{self.config.experiment_name}_pseudo_label.json"
         )
 
     def _export_report_path(self) -> Path:

@@ -125,3 +125,21 @@ def test_build_config_accepts_training_backend_for_benchmark() -> None:
     config = build_config(args)
 
     assert config.training_backend == "rust_tch"
+
+
+def test_build_config_accepts_pseudo_label_thresholds() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "pseudo-label",
+            "--pseudo-label-threshold",
+            "0.91",
+            "--pseudo-label-margin",
+            "0.22",
+        ]
+    )
+    config = build_config(args)
+
+    assert config.pseudo_label_confidence_threshold == 0.91
+    assert config.pseudo_label_margin_threshold == 0.22

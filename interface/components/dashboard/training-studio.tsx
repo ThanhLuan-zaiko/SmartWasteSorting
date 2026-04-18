@@ -5,7 +5,7 @@ import { HiBeaker, HiBolt, HiPlayCircle, HiSparkles } from "react-icons/hi2";
 import { useLocalAgent } from "@/components/localagent-provider";
 import { useThemeMode } from "@/components/theme-provider";
 import { Panel } from "@/components/ui/primitives";
-import { TRAINING_ACTIONS } from "@/lib/localagent";
+import { asObject, TRAINING_ACTIONS } from "@/lib/localagent";
 
 const MODEL_OPTIONS = [
   "mobilenet_v3_small",
@@ -14,10 +14,23 @@ const MODEL_OPTIONS = [
   "efficientnet_b0",
 ];
 
+const DATASET_REQUIRED_ACTIONS = new Set([
+  "warm-cache",
+  "pseudo-label",
+  "fit",
+  "evaluate",
+  "benchmark",
+]);
+
+const MULTI_CLASS_REQUIRED_ACTIONS = new Set(["fit", "benchmark"]);
+const PYTORCH_ONLY_ACTIONS = new Set(["fit", "evaluate", "export-onnx"]);
+const CHECKPOINT_REQUIRED_ACTIONS = new Set(["pseudo-label", "evaluate", "export-onnx"]);
+
 export function TrainingStudio() {
   const { isDark } = useThemeMode();
   const {
     runs,
+    runDetail,
     trainingPresets,
     trainingForm,
     isSubmitting,
@@ -34,11 +47,57 @@ export function TrainingStudio() {
   ].join(" ");
 
   const labelClass = "text-xs font-semibold uppercase tracking-[0.22em] text-zinc-500";
+  const dashboardSummary = asObject(runDetail?.dashboard_summary);
+  const status = asObject(dashboardSummary?.status);
+  const datasetSummary = asObject(dashboardSummary?.dataset_summary);
+  const labelCounts = asObject(datasetSummary?.label_counts);
+  const acceptedLabelSourceCounts = asObject(datasetSummary?.accepted_label_source_counts);
+  const trainableLabelCounts = asObject(datasetSummary?.trainable_label_counts);
+  const datasetReady = status?.dataset_ready === true;
+  const datasetReadyKnown = typeof status?.dataset_ready === "boolean";
+  const trainingReady = status?.training_ready === true;
+  const detectedLabels = Object.keys(labelCounts ?? {}).filter((label) => label !== "unknown");
+  const trainableLabels = Object.keys(trainableLabelCounts ?? {}).filter(
+    (label) => label !== "unknown",
+  );
+  const acceptedSourceSummary = Object.entries(acceptedLabelSourceCounts ?? {})
+    .map(([label, count]) => `${label}: ${count}`)
+    .join(", ");
+  const effectiveTrainingMode =
+    typeof datasetSummary?.effective_training_mode === "string"
+      ? datasetSummary.effective_training_mode
+      : "weak_inferred";
+
+  function actionBlockReason(command: string): string | null {
+    if (
+      datasetReadyKnown &&
+      !datasetReady &&
+      DATASET_REQUIRED_ACTIONS.has(command)
+    ) {
+      return "Run dataset pipeline `run-all` first to create artifacts/manifests/dataset_manifest.parquet.";
+    }
+    if (
+      MULTI_CLASS_REQUIRED_ACTIONS.has(command) &&
+      trainableLabels.length < 2
+    ) {
+      return `Training requires at least 2 trainable labels. The current manifest only contains: ${trainableLabels.join(", ") || "none"}.`;
+    }
+    if (CHECKPOINT_REQUIRED_ACTIONS.has(command) && !trainingReady) {
+      return "Run an initial `fit` first so a checkpoint exists for this step.";
+    }
+    if (
+      trainingForm.training_backend === "rust_tch" &&
+      (PYTORCH_ONLY_ACTIONS.has(command) || command === "pseudo-label")
+    ) {
+      return "Choose `pytorch` for this step. `rust_tch` is preview-only for summary, export-spec, and benchmark.";
+    }
+    return null;
+  }
 
   return (
     <Panel
-      title="Training studio"
-      description="Preset-driven run setup with manual control over model, epoch, batch, bias, backend, and benchmark comparison."
+      title="Step 3: Training studio"
+      description="Once discovery has produced accepted labels, use these controls to pseudo-label the remaining pool, train the classifier, evaluate it, export ONNX, and run benchmarks."
       actions={
         <div className="flex flex-wrap gap-2">
           {Object.keys(trainingPresets).map((presetName) => (
@@ -100,7 +159,7 @@ export function TrainingStudio() {
             onChange={(event) => setTrainingField("training_backend", event.target.value)}
           >
             <option value="pytorch">pytorch</option>
-            <option value="rust_tch">rust_tch</option>
+            <option value="rust_tch">rust_tch (preview)</option>
           </select>
         </div>
         <div className="flex flex-col gap-2">
@@ -201,44 +260,138 @@ export function TrainingStudio() {
                 <option key={run.experiment_name} value={run.experiment_name}>
                   {run.experiment_name}
                 </option>
-              ))}
+            ))}
           </select>
+        </div>
+        <div className="flex flex-col gap-2">
+          <label className={labelClass} htmlFor="pseudo_label_threshold">
+            Pseudo-label confidence
+          </label>
+          <input
+            id="pseudo_label_threshold"
+            className={fieldClass}
+            value={trainingForm.pseudo_label_threshold}
+            onChange={(event) => setTrainingField("pseudo_label_threshold", event.target.value)}
+          />
+        </div>
+        <div className="flex flex-col gap-2">
+          <label className={labelClass} htmlFor="pseudo_label_margin">
+            Pseudo-label margin
+          </label>
+          <input
+            id="pseudo_label_margin"
+            className={fieldClass}
+            value={trainingForm.pseudo_label_margin}
+            onChange={(event) => setTrainingField("pseudo_label_margin", event.target.value)}
+          />
         </div>
       </div>
 
+      <div
+        className={[
+          "mt-5 rounded-[1.2rem] border px-4 py-3 text-sm leading-6",
+          isDark
+            ? "border-zinc-800 bg-zinc-950 text-zinc-300"
+            : "border-zinc-200 bg-zinc-50 text-zinc-700",
+        ].join(" ")}
+      >
+        <p>
+          Dataset manifest:{" "}
+          <span className="font-semibold">
+            {datasetReadyKnown ? (datasetReady ? "ready" : "missing") : "checking"}
+          </span>
+          . Training steps that read the manifest are blocked until the dataset pipeline writes
+          `artifacts/manifests/dataset_manifest.parquet`.
+        </p>
+        <p className="mt-2">
+          `rust_tch` stays available for preview metadata flows such as `summary`, `export-spec`,
+          and `benchmark`. Actual training and evaluation still run with `pytorch` in this build.
+        </p>
+        <p className="mt-2">
+          Effective training mode: <span className="font-semibold">{effectiveTrainingMode}</span>.
+        </p>
+        {detectedLabels.length > 0 ? (
+          <p className="mt-2">
+            Detected labels: <span className="font-semibold">{detectedLabels.join(", ")}</span>
+            {detectedLabels.length < 2
+              ? ". Add at least one more class or import curated labels before running fit."
+              : "."}
+          </p>
+        ) : null}
+        {trainableLabels.length > 0 ? (
+          <p className="mt-2">
+            Trainable labels: <span className="font-semibold">{trainableLabels.join(", ")}</span>.
+          </p>
+        ) : null}
+        {acceptedSourceSummary ? (
+          <p className="mt-2">
+            Accepted label sources: <span className="font-semibold">{acceptedSourceSummary}</span>.
+          </p>
+        ) : null}
+        <label className="mt-3 flex items-start gap-3">
+          <input
+            type="checkbox"
+            className="mt-1 size-4 rounded border-zinc-300"
+            checked={trainingForm.no_progress}
+            onChange={(event) => setTrainingField("no_progress", event.target.checked)}
+          />
+          <span>
+            <span className="font-semibold">Use --no-progress</span>
+            <span
+              className={[
+                "block text-sm",
+                isDark ? "text-zinc-400" : "text-zinc-600",
+              ].join(" ")}
+            >
+              Turn this off to stream detailed progress lines into the Jobs websocket while
+              training runs.
+            </span>
+          </span>
+        </label>
+      </div>
+
       <div className="mt-6 flex flex-wrap gap-3">
-        {TRAINING_ACTIONS.map((command) => (
-          <button
-            key={command}
-            type="button"
-            disabled={isSubmitting !== null}
-            onClick={() => void submitTraining(command)}
-            className={[
-              "inline-flex items-center gap-2 rounded-full px-4 py-3 text-sm font-semibold transition",
-              command === "fit"
-                ? isDark
-                  ? "bg-white text-black hover:bg-zinc-200"
-                  : "bg-zinc-950 text-white hover:bg-zinc-800"
-                : isDark
-                  ? "bg-zinc-950 text-zinc-300 hover:bg-zinc-800"
-                  : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200",
-              isSubmitting !== null ? "opacity-60" : "",
-            ].join(" ")}
-          >
-            {command === "fit" ? <HiPlayCircle /> : <HiBeaker />}
-            {isSubmitting === command ? `Starting ${command}...` : command}
-          </button>
-        ))}
+        {TRAINING_ACTIONS.map((command) => {
+          const blockReason = actionBlockReason(command);
+          const isDisabled = isSubmitting !== null || blockReason !== null;
+
+          return (
+            <button
+              key={command}
+              type="button"
+              disabled={isDisabled}
+              title={blockReason ?? undefined}
+              onClick={() => void submitTraining(command)}
+              className={[
+                "inline-flex items-center gap-2 rounded-full px-4 py-3 text-sm font-semibold transition",
+                command === "fit" || command === "pseudo-label"
+                  ? isDark
+                    ? "bg-white text-black hover:bg-zinc-200"
+                    : "bg-zinc-950 text-white hover:bg-zinc-800"
+                  : isDark
+                    ? "bg-zinc-950 text-zinc-300 hover:bg-zinc-800"
+                    : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200",
+                isDisabled ? "opacity-60" : "",
+              ].join(" ")}
+            >
+              {command === "fit" ? <HiPlayCircle /> : <HiBeaker />}
+              {isSubmitting === command ? `Starting ${command}...` : command}
+            </button>
+          );
+        })}
         <button
           type="button"
-          disabled={isSubmitting !== null}
+          disabled={isSubmitting !== null || actionBlockReason("benchmark") !== null}
+          title={actionBlockReason("benchmark") ?? undefined}
           onClick={() => void submitTraining("benchmark")}
           className={[
             "inline-flex items-center gap-2 rounded-full px-4 py-3 text-sm font-semibold transition",
             isDark
               ? "bg-emerald-400 text-black hover:bg-emerald-300"
               : "bg-emerald-500 text-white hover:bg-emerald-600",
-            isSubmitting !== null ? "opacity-60" : "",
+            isSubmitting !== null || actionBlockReason("benchmark") !== null
+              ? "opacity-60"
+              : "",
           ].join(" ")}
         >
           <HiBolt />

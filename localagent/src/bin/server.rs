@@ -6,8 +6,9 @@ use localagent_rs::{
     JobStreamEvent, PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier,
 };
 use serde::Deserialize;
-use serde_json::json;
-use tokio::{sync::broadcast, time::Duration};
+use serde_json::{json, Value};
+use std::path::{Component, Path, PathBuf};
+use tokio::{fs, sync::broadcast, time::Duration};
 
 #[derive(Debug, Deserialize)]
 struct ClassificationRequest {
@@ -17,6 +18,11 @@ struct ClassificationRequest {
 #[derive(Debug, Deserialize)]
 struct ArtifactQuery {
     experiment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetImageQuery {
+    relative_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +287,10 @@ async fn pipeline_presets() -> impl Responder {
             "split",
             "report",
             "run-all",
+            "embed",
+            "cluster",
+            "export-cluster-review",
+            "promote-cluster-labels",
             "export-labeling-template",
             "import-labels",
             "validate-labels"
@@ -290,6 +300,7 @@ async fn pipeline_presets() -> impl Responder {
             "export-spec",
             "export-labels",
             "warm-cache",
+            "pseudo-label",
             "fit",
             "evaluate",
             "export-onnx",
@@ -391,6 +402,81 @@ async fn dashboard_summary(
     }
 }
 
+#[get("/dataset/image")]
+async fn dataset_image(
+    store: web::Data<ArtifactStore>,
+    query: web::Query<DatasetImageQuery>,
+) -> impl Responder {
+    let sanitized_relative = match sanitize_relative_dataset_path(&query.relative_path) {
+        Some(path) => path,
+        None => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "relative_path must be a non-empty dataset-relative path",
+                "relative_path": query.relative_path,
+            }));
+        }
+    };
+
+    let dataset_root = match dataset_root_from_store(&store) {
+        Ok(path) => path,
+        Err(error) => {
+            return HttpResponse::NotFound().json(json!({
+                "error": error,
+            }));
+        }
+    };
+
+    let canonical_root = match std::fs::canonicalize(&dataset_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "error": format!(
+                    "failed to resolve dataset root {}: {}",
+                    dataset_root.display(),
+                    error
+                ),
+            }));
+        }
+    };
+
+    let candidate = canonical_root.join(&sanitized_relative);
+    let canonical_candidate = match std::fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            return HttpResponse::NotFound().json(json!({
+                "error": format!(
+                    "dataset image not found for {}: {}",
+                    sanitized_relative.display(),
+                    error
+                ),
+                "relative_path": query.relative_path,
+            }));
+        }
+    };
+
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return HttpResponse::BadRequest().json(json!({
+            "error": "relative_path resolved outside the dataset root",
+            "relative_path": query.relative_path,
+        }));
+    }
+
+    match fs::read(&canonical_candidate).await {
+        Ok(bytes) => HttpResponse::Ok()
+            .insert_header(("Cache-Control", "no-store"))
+            .content_type(content_type_for_path(&canonical_candidate))
+            .body(bytes),
+        Err(error) => HttpResponse::InternalServerError().json(json!({
+            "error": format!(
+                "failed to read dataset image {}: {}",
+                canonical_candidate.display(),
+                error
+            ),
+            "relative_path": query.relative_path,
+        })),
+    }
+}
+
 #[get("/artifacts/dataset")]
 async fn artifacts_dataset(
     store: web::Data<ArtifactStore>,
@@ -465,6 +551,78 @@ fn artifact_response(
         Err(error) => HttpResponse::InternalServerError().json(json!({
             "error": error.to_string(),
         })),
+    }
+}
+
+fn dataset_root_from_store(store: &ArtifactStore) -> Result<PathBuf, String> {
+    let summary_path = store.artifact_path(ArtifactKind::DatasetSummary, None);
+    let payload = std::fs::read_to_string(&summary_path).map_err(|error| {
+        format!(
+            "dataset summary not found at {}. Run the dataset pipeline first. {}",
+            summary_path.display(),
+            error
+        )
+    })?;
+    let summary: Value = serde_json::from_str(&payload).map_err(|error| {
+        format!(
+            "failed to parse dataset summary at {}: {}",
+            summary_path.display(),
+            error
+        )
+    })?;
+    let dataset_root = summary
+        .get("dataset_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "dataset summary at {} does not contain a usable dataset_root",
+                summary_path.display()
+            )
+        })?;
+    Ok(PathBuf::from(dataset_root))
+}
+
+fn sanitize_relative_dataset_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
     }
 }
 
@@ -596,6 +754,7 @@ async fn main() -> std::io::Result<()> {
             .service(artifacts_benchmark)
             .service(artifacts_experiment_spec)
             .service(dashboard_summary)
+            .service(dataset_image)
             .service(artifacts_dataset)
             .service(artifacts_training)
             .service(artifacts_evaluation)

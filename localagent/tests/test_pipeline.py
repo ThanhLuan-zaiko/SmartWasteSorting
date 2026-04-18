@@ -264,3 +264,100 @@ def test_validate_labels_warns_when_manifest_has_single_class(tmp_path: Path) ->
 
     assert validation["num_classes"] == 1
     assert any("at least 2 classes" in warning for warning in validation["warnings"])
+
+
+def test_embed_cluster_and_export_cluster_review(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("alpha_1.jpg", 10),
+        ("alpha_2.jpg", 15),
+        ("beta_1.jpg", 220),
+        ("beta_2.jpg", 225),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+
+    embedding_summary = pipeline.embed_dataset()
+    cluster_summary = pipeline.cluster_dataset(requested_clusters=2)
+    review_summary = pipeline.export_cluster_review()
+    manifest_frame = pipeline.load_manifest()
+
+    assert Path(str(embedding_summary["embedding_path"])).is_file()
+    assert Path(str(cluster_summary["cluster_summary_path"])).is_file()
+    assert Path(str(review_summary["review_path"])).is_file()
+    assert manifest_frame.get_column("cluster_id").null_count() == 0
+    assert int(cluster_summary["cluster_count"]) == 2
+
+    review_rows = list(
+        csv.DictReader(
+            Path(str(review_summary["review_path"])).open("r", encoding="utf-8", newline="")
+        )
+    )
+    dataset_summary = json.loads(config.summary_path.read_text(encoding="utf-8"))
+
+    assert len(review_rows) == 2
+    assert dataset_summary["cluster_preview_total"] == 2
+    assert len(dataset_summary["cluster_previews"]) == 2
+    assert dataset_summary["cluster_previews"][0]["representatives"]
+
+
+def test_promote_cluster_labels_switches_manifest_to_accepted_labels_only_mode(
+    tmp_path: Path,
+) -> None:
+    config = _build_config(
+        tmp_path,
+        train_ratio=0.5,
+        val_ratio=0.25,
+        test_ratio=0.25,
+    )
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("R_1.jpg", 10),
+        ("R_2.jpg", 12),
+        ("R_3.jpg", 220),
+        ("R_4.jpg", 224),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    pipeline.embed_dataset()
+    pipeline.cluster_dataset(requested_clusters=2)
+    review_summary = pipeline.export_cluster_review()
+    review_path = Path(str(review_summary["review_path"]))
+    review_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+    assert len(review_rows) == 2
+
+    labels_by_cluster = {
+        review_rows[0]["cluster_id"]: "glass",
+        review_rows[1]["cluster_id"]: "plastic",
+    }
+    with review_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=review_rows[0].keys())
+        writer.writeheader()
+        for row in review_rows:
+            row["label"] = labels_by_cluster[row["cluster_id"]]
+            row["status"] = "labeled"
+            writer.writerow(row)
+
+    promote_summary = pipeline.promote_cluster_labels(review_path)
+    manifest_frame = pipeline.load_manifest()
+    validation = pipeline.validate_labels(manifest_frame)
+    trainable_labels = set(validation["train_label_counts"])
+
+    assert promote_summary["clusters_applied"] == 2
+    assert validation["effective_training_mode"] == "accepted_labels_only"
+    assert validation["num_classes"] == 2
+    assert trainable_labels == {"glass", "plastic"}
+    assert all(
+        row["label_source"] == "cluster_review"
+        for row in manifest_frame.iter_rows(named=True)
+        if row["label"] != config.unknown_label
+    )

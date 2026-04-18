@@ -102,6 +102,8 @@ class TrainingConfig:
     enable_early_stopping: bool = True
     show_progress: bool = True
     device: str = "auto"
+    pseudo_label_confidence_threshold: float = 0.85
+    pseudo_label_margin_threshold: float = 0.15
 
 
 @dataclass(slots=True)
@@ -112,6 +114,8 @@ class DatasetPipelineConfig:
     manifest_name: str = "dataset_manifest.parquet"
     manifest_csv_name: str = "dataset_manifest.csv"
     labeling_template_name: str = "labeling_template.csv"
+    cluster_review_template_name: str = "cluster_review.csv"
+    embeddings_name: str = "dataset_embeddings.npz"
     min_width: int = 32
     min_height: int = 32
     train_ratio: float = 0.8
@@ -137,8 +141,24 @@ class DatasetPipelineConfig:
         return self.manifest_dir / self.labeling_template_name
 
     @property
+    def cluster_review_template_path(self) -> Path:
+        return self.manifest_dir / self.cluster_review_template_name
+
+    @property
+    def embeddings_path(self) -> Path:
+        return self.manifest_dir / self.embeddings_name
+
+    @property
     def summary_path(self) -> Path:
         return self.report_dir / "summary.json"
+
+    @property
+    def embedding_summary_path(self) -> Path:
+        return self.report_dir / "embedding_summary.json"
+
+    @property
+    def cluster_summary_path(self) -> Path:
+        return self.report_dir / "cluster_summary.json"
 
     @property
     def split_summary_path(self) -> Path:

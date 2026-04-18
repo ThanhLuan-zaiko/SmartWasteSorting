@@ -125,11 +125,18 @@ export type TrainingFormState = {
   class_bias: string;
   device: string;
   compare_experiment: string;
+  pseudo_label_threshold: string;
+  pseudo_label_margin: string;
+  no_progress: boolean;
 };
 
 export type PipelineFormState = {
   labels_file: string;
-  output: string;
+  review_file: string;
+  template_output: string;
+  review_output: string;
+  num_clusters: string;
+  no_progress: boolean;
 };
 
 export const DATASET_ACTIONS = [
@@ -139,10 +146,18 @@ export const DATASET_ACTIONS = [
   "validate-labels",
 ] as const;
 
+export const DISCOVERY_ACTIONS = [
+  "embed",
+  "cluster",
+  "export-cluster-review",
+  "promote-cluster-labels",
+] as const;
+
 export const TRAINING_ACTIONS = [
   "summary",
   "export-spec",
   "warm-cache",
+  "pseudo-label",
   "fit",
   "evaluate",
   "export-onnx",

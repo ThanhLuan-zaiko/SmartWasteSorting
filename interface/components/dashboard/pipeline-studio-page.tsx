@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { HiArrowUpRight, HiBars3BottomLeft, HiChartBarSquare } from "react-icons/hi2";
 
+import { DiscoveryStudio } from "@/components/dashboard/discovery-studio";
 import { PipelineActions } from "@/components/dashboard/pipeline-actions";
 import { SystemNotices } from "@/components/dashboard/system-notices";
 import { TrainingStudio } from "@/components/dashboard/training-studio";
@@ -17,7 +18,7 @@ export function PipelineStudioPage() {
       <PageIntro
         badge="Pipelines"
         title="Build and launch runs from forms"
-        description="This page replaces repetitive CLI commands with reusable controls for dataset preparation, training, evaluation, ONNX export, and benchmark jobs."
+        description="Start with the dataset pipeline, then use discovery tools to group ambiguous images, promote accepted labels, and finally move into training, evaluation, ONNX export, and benchmarks."
         actions={
           <>
             <Link
@@ -49,8 +50,9 @@ export function PipelineStudioPage() {
       />
 
       <SystemNotices />
-      <TrainingStudio />
       <PipelineActions />
+      <DiscoveryStudio />
+      <TrainingStudio />
 
       <Panel
         title="Artifact-first workflow"

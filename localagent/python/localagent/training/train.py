@@ -83,12 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--onnx-opset", type=int, default=None)
     common.add_argument("--export-batch-size", type=int, default=None)
     common.add_argument("--skip-onnx-verify", action="store_true")
+    common.add_argument("--pseudo-label-threshold", type=float, default=None)
+    common.add_argument("--pseudo-label-margin", type=float, default=None)
     common.add_argument("--no-progress", action="store_true")
 
     subparsers.add_parser("summary", parents=[common])
     subparsers.add_parser("export-spec", parents=[common])
     subparsers.add_parser("export-labels", parents=[common])
     subparsers.add_parser("warm-cache", parents=[common])
+    subparsers.add_parser("pseudo-label", parents=[common])
     subparsers.add_parser("fit", parents=[common])
     subparsers.add_parser("evaluate", parents=[common])
     subparsers.add_parser("export-onnx", parents=[common])
@@ -188,6 +191,16 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         enable_early_stopping=not args.disable_early_stopping,
         show_progress=not args.no_progress,
         device=defaults.device if args.device is None else args.device,
+        pseudo_label_confidence_threshold=(
+            defaults.pseudo_label_confidence_threshold
+            if args.pseudo_label_threshold is None
+            else args.pseudo_label_threshold
+        ),
+        pseudo_label_margin_threshold=(
+            defaults.pseudo_label_margin_threshold
+            if args.pseudo_label_margin is None
+            else args.pseudo_label_margin
+        ),
     )
 
 
@@ -219,6 +232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "warm-cache":
         summary = trainer.warm_image_cache()
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "pseudo-label":
+        summary = trainer.pseudo_label(checkpoint_path=args.checkpoint)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 

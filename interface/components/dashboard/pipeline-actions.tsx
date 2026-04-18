@@ -26,10 +26,46 @@ export function PipelineActions() {
 
   return (
     <Panel
-      title="Dataset pipeline"
-      description="Trigger scan, labeling, validation, and manifest/report steps from the UI instead of typing the CLI repeatedly."
+      title="Step 1: Dataset pipeline"
+      description="Start here. Run `run-all` to scan the raw images, generate splits, and write the manifest required by the training tools."
     >
-      <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+      <div
+        className={[
+          "rounded-[1.3rem] border px-4 py-3 text-sm leading-6",
+          isDark
+            ? "border-emerald-900 bg-emerald-950/50 text-emerald-100"
+            : "border-emerald-200 bg-emerald-50 text-emerald-900",
+        ].join(" ")}
+      >
+        <p className="font-semibold">Recommended first action</p>
+        <p className={["mt-1", isDark ? "text-emerald-200/90" : "text-emerald-800"].join(" ")}>
+          Click <span className="font-semibold">run-all</span> first. It creates
+          `artifacts/manifests/dataset_manifest.parquet`, which unlocks warm-cache, fit,
+          evaluate, and benchmark.
+        </p>
+        <label className="mt-3 flex items-start gap-3">
+          <input
+            type="checkbox"
+            className="mt-1 size-4 rounded border-zinc-300"
+            checked={pipelineForm.no_progress}
+            onChange={(event) => setPipelineField("no_progress", event.target.checked)}
+          />
+          <span>
+            <span className="font-semibold">Use --no-progress</span>
+            <span
+              className={[
+                "block text-sm",
+                isDark ? "text-emerald-200/90" : "text-emerald-800",
+              ].join(" ")}
+            >
+              Turn this off if you want the Jobs websocket to stream more progress lines while the
+              dataset pipeline runs.
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div className="mt-5 grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
         <div className="grid gap-4 md:grid-cols-2">
           <div className="flex flex-col gap-2">
             <label
@@ -55,8 +91,8 @@ export function PipelineActions() {
             <input
               id="template_output"
               className={fieldClass}
-              value={pipelineForm.output}
-              onChange={(event) => setPipelineField("output", event.target.value)}
+              value={pipelineForm.template_output}
+              onChange={(event) => setPipelineField("template_output", event.target.value)}
             />
           </div>
         </div>

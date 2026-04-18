@@ -86,3 +86,6 @@ localagent/artifacts/reports/*
 !localagent/artifacts/reports/.gitkeep
 localagent/artifacts/cache/*
 !localagent/artifacts/cache/.gitkeep
+localagent/artifacts/checkpoints/
+localagent/artifacts/jobs/
+localagent/logs/

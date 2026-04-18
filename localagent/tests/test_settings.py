@@ -57,6 +57,8 @@ def test_runtime_and_training_defaults_are_stable() -> None:
     assert training.enable_early_stopping is True
     assert training.manifest_path.name == "dataset_manifest.parquet"
     assert training.labels_output_path.name == "labels.json"
+    assert training.pseudo_label_confidence_threshold == 0.85
+    assert training.pseudo_label_margin_threshold == 0.15
 
 
 def test_dataset_pipeline_defaults_are_stable() -> None:
@@ -68,3 +70,5 @@ def test_dataset_pipeline_defaults_are_stable() -> None:
     assert config.random_seed == 42
     assert config.label_summary_path.name == "label_summary.csv"
     assert config.labeling_template_path.name == "labeling_template.csv"
+    assert config.cluster_review_template_path.name == "cluster_review.csv"
+    assert config.embeddings_path.name == "dataset_embeddings.npz"

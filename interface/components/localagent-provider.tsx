@@ -51,8 +51,14 @@ type LocalAgentContextValue = {
   setSelectedExperiment: (value: string) => void;
   setCompareExperiment: (value: string) => void;
   setActiveJobId: (jobId: string | null) => void;
-  setTrainingField: (field: keyof TrainingFormState, value: string) => void;
-  setPipelineField: (field: keyof PipelineFormState, value: string) => void;
+  setTrainingField: <K extends keyof TrainingFormState>(
+    field: K,
+    value: TrainingFormState[K],
+  ) => void;
+  setPipelineField: <K extends keyof PipelineFormState>(
+    field: K,
+    value: PipelineFormState[K],
+  ) => void;
   applyPreset: (presetName: string) => void;
   refreshAll: () => Promise<void>;
   ensureRunLoaded: (experimentName: string) => Promise<void>;
@@ -147,11 +153,18 @@ export function LocalAgentProvider({ children }: { children: React.ReactNode }) 
     class_bias: "loss",
     device: "auto",
     compare_experiment: "",
+    pseudo_label_threshold: "0.85",
+    pseudo_label_margin: "0.15",
+    no_progress: true,
   });
 
   const [pipelineForm, setPipelineForm] = useState<PipelineFormState>({
     labels_file: "artifacts/manifests/labeling_template.csv",
-    output: "artifacts/manifests/labeling_template.csv",
+    review_file: "artifacts/manifests/cluster_review.csv",
+    template_output: "artifacts/manifests/labeling_template.csv",
+    review_output: "artifacts/manifests/cluster_review.csv",
+    num_clusters: "",
+    no_progress: true,
   });
 
   async function loadCatalog() {
@@ -286,13 +299,22 @@ export function LocalAgentProvider({ children }: { children: React.ReactNode }) 
     try {
       const payload: Record<string, unknown> = {
         command,
-        no_progress: true,
+        no_progress: pipelineForm.no_progress,
       };
       if (pipelineForm.labels_file) {
         payload.labels_file = pipelineForm.labels_file;
       }
-      if (pipelineForm.output) {
-        payload.output = pipelineForm.output;
+      if (pipelineForm.review_file) {
+        payload.review_file = pipelineForm.review_file;
+      }
+      if (command === "export-labeling-template" && pipelineForm.template_output) {
+        payload.output = pipelineForm.template_output;
+      }
+      if (command === "export-cluster-review" && pipelineForm.review_output) {
+        payload.output = pipelineForm.review_output;
+      }
+      if (pipelineForm.num_clusters.trim()) {
+        payload.num_clusters = toNumberString(pipelineForm.num_clusters);
       }
 
       const created = await fetchJson<JobRecord>("/jobs/pipeline", {
@@ -329,7 +351,9 @@ export function LocalAgentProvider({ children }: { children: React.ReactNode }) 
         epochs: toNumberString(trainingForm.epochs),
         class_bias: trainingForm.class_bias,
         device: trainingForm.device,
-        no_progress: true,
+        pseudo_label_threshold: toNumberString(trainingForm.pseudo_label_threshold),
+        pseudo_label_margin: toNumberString(trainingForm.pseudo_label_margin),
+        no_progress: trainingForm.no_progress,
       };
 
       const endpoint = command === "benchmark" ? "/jobs/benchmark" : "/jobs/training";
@@ -407,14 +431,20 @@ export function LocalAgentProvider({ children }: { children: React.ReactNode }) 
     }));
   }
 
-  function setTrainingField(field: keyof TrainingFormState, value: string) {
+  function setTrainingField<K extends keyof TrainingFormState>(
+    field: K,
+    value: TrainingFormState[K],
+  ) {
     setTrainingForm((current) => ({
       ...current,
       [field]: value,
     }));
   }
 
-  function setPipelineField(field: keyof PipelineFormState, value: string) {
+  function setPipelineField<K extends keyof PipelineFormState>(
+    field: K,
+    value: PipelineFormState[K],
+  ) {
     setPipelineForm((current) => ({
       ...current,
       [field]: value,
