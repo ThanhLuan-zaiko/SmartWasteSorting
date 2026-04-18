@@ -1,4 +1,5 @@
 mod artifacts;
+mod cluster_review;
 mod config;
 mod domain;
 mod error;
@@ -10,6 +11,9 @@ mod training_cache;
 mod training_metrics;
 
 pub use artifacts::{to_api_envelope, ArtifactKind, ArtifactStore};
+pub use cluster_review::{
+    ClusterReviewError, ClusterReviewSaveRequest, ClusterReviewState, ClusterReviewStore,
+};
 pub use config::RuntimeConfig;
 pub use domain::{ClassificationResult, Prediction};
 pub use error::AgentError;

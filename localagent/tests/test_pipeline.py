@@ -306,6 +306,81 @@ def test_embed_cluster_and_export_cluster_review(tmp_path: Path) -> None:
     assert dataset_summary["cluster_previews"][0]["representatives"]
 
 
+def test_export_cluster_review_preserves_matching_saved_rows(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("alpha_1.jpg", 10),
+        ("alpha_2.jpg", 15),
+        ("beta_1.jpg", 220),
+        ("beta_2.jpg", 225),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    pipeline.embed_dataset()
+    pipeline.cluster_dataset(requested_clusters=2)
+
+    review_summary = pipeline.export_cluster_review()
+    review_path = Path(str(review_summary["review_path"]))
+    review_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+    review_rows[0]["label"] = "glass"
+    review_rows[0]["status"] = "labeled"
+
+    with review_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=review_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(review_rows)
+
+    refreshed_summary = pipeline.export_cluster_review()
+    refreshed_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+
+    assert refreshed_summary["stale_reset_count"] == 0
+    assert refreshed_rows[0]["label"] == "glass"
+    assert refreshed_rows[0]["status"] == "labeled"
+
+
+def test_export_cluster_review_resets_stale_rows(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("alpha_1.jpg", 10),
+        ("alpha_2.jpg", 15),
+        ("beta_1.jpg", 220),
+        ("beta_2.jpg", 225),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    pipeline.embed_dataset()
+    pipeline.cluster_dataset(requested_clusters=2)
+
+    review_summary = pipeline.export_cluster_review()
+    review_path = Path(str(review_summary["review_path"]))
+    review_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+    review_rows[0]["label"] = "glass"
+    review_rows[0]["status"] = "labeled"
+    review_rows[0]["representative_sample_ids"] = "stale-sample"
+
+    with review_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=review_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(review_rows)
+
+    refreshed_summary = pipeline.export_cluster_review()
+    refreshed_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+
+    assert refreshed_summary["stale_reset_count"] == 1
+    assert refreshed_rows[0]["label"] == ""
+    assert refreshed_rows[0]["status"] == "unlabeled"
+
+
 def test_promote_cluster_labels_switches_manifest_to_accepted_labels_only_mode(
     tmp_path: Path,
 ) -> None:
@@ -361,3 +436,51 @@ def test_promote_cluster_labels_switches_manifest_to_accepted_labels_only_mode(
         for row in manifest_frame.iter_rows(named=True)
         if row["label"] != config.unknown_label
     )
+
+
+def test_promote_cluster_labels_skips_stale_review_rows(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("alpha_1.jpg", 10),
+        ("alpha_2.jpg", 15),
+        ("beta_1.jpg", 220),
+        ("beta_2.jpg", 225),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    pipeline.embed_dataset()
+    pipeline.cluster_dataset(requested_clusters=2)
+    review_summary = pipeline.export_cluster_review()
+    review_path = Path(str(review_summary["review_path"]))
+    review_rows = list(csv.DictReader(review_path.open("r", encoding="utf-8", newline="")))
+    assert len(review_rows) == 2
+
+    review_rows[0]["label"] = "glass"
+    review_rows[0]["status"] = "labeled"
+    review_rows[1]["label"] = "plastic"
+    review_rows[1]["status"] = "labeled"
+    review_rows[1]["representative_sample_ids"] = "stale-sample"
+
+    with review_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=review_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(review_rows)
+
+    promote_summary = pipeline.promote_cluster_labels(review_path)
+    manifest_frame = pipeline.load_manifest()
+    validation = pipeline.validate_labels(manifest_frame)
+    promoted_labels = {
+        row["label"]
+        for row in manifest_frame.iter_rows(named=True)
+        if row["label"] != config.unknown_label and row["label_source"] == "cluster_review"
+    }
+
+    assert promote_summary["clusters_applied"] == 1
+    assert promote_summary["stale_cluster_count"] == 1
+    assert validation["effective_training_mode"] == "accepted_labels_only"
+    assert promoted_labels == {"glass"}

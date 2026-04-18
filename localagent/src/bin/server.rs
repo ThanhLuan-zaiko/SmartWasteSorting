@@ -1,9 +1,10 @@
-use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{get, post, put, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_ws::{Message, MessageStream, Session};
 use futures_util::StreamExt;
 use localagent_rs::{
-    init_tracing, to_api_envelope, ArtifactKind, ArtifactStore, BenchmarkJobRequest, JobManager,
-    JobStreamEvent, PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier,
+    init_tracing, to_api_envelope, ArtifactKind, ArtifactStore, BenchmarkJobRequest,
+    ClusterReviewError, ClusterReviewSaveRequest, ClusterReviewStore, JobManager, JobStreamEvent,
+    PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,6 +41,11 @@ struct JobStreamQuery {
 struct CompareQuery {
     #[serde(rename = "with")]
     with_experiment: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterReviewQuery {
+    review_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,6 +483,38 @@ async fn dataset_image(
     }
 }
 
+#[get("/cluster-review")]
+async fn cluster_review(
+    config: web::Data<RuntimeConfig>,
+    query: web::Query<ClusterReviewQuery>,
+) -> impl Responder {
+    let store = ClusterReviewStore::new(config.get_ref().clone());
+    match store.load_review_state(query.review_file.as_deref()) {
+        Ok(payload) => HttpResponse::Ok().json(payload),
+        Err(error) => cluster_review_error_response(error),
+    }
+}
+
+#[put("/cluster-review")]
+async fn save_cluster_review(
+    config: web::Data<RuntimeConfig>,
+    jobs: web::Data<JobManager>,
+    request: web::Json<ClusterReviewSaveRequest>,
+) -> impl Responder {
+    if jobs.has_active_job_type("dataset_pipeline") {
+        return HttpResponse::Conflict().json(json!({
+            "error": "Cluster review cannot be saved while a dataset pipeline job is running. Wait for the active dataset job to finish, then retry.",
+            "stale_cluster_ids": [],
+        }));
+    }
+
+    let store = ClusterReviewStore::new(config.get_ref().clone());
+    match store.save_review(request.into_inner()) {
+        Ok(payload) => HttpResponse::Ok().json(payload),
+        Err(error) => cluster_review_error_response(error),
+    }
+}
+
 #[get("/artifacts/dataset")]
 async fn artifacts_dataset(
     store: web::Data<ArtifactStore>,
@@ -551,6 +589,24 @@ fn artifact_response(
         Err(error) => HttpResponse::InternalServerError().json(json!({
             "error": error.to_string(),
         })),
+    }
+}
+
+fn cluster_review_error_response(error: ClusterReviewError) -> HttpResponse {
+    match error {
+        ClusterReviewError::InvalidRequest(message) => {
+            HttpResponse::BadRequest().json(json!({ "error": message }))
+        }
+        ClusterReviewError::Conflict {
+            message,
+            stale_cluster_ids,
+        } => HttpResponse::Conflict().json(json!({
+            "error": message,
+            "stale_cluster_ids": stale_cluster_ids,
+        })),
+        ClusterReviewError::Internal(message) => {
+            HttpResponse::InternalServerError().json(json!({ "error": message }))
+        }
     }
 }
 
@@ -724,12 +780,14 @@ async fn main() -> std::io::Result<()> {
 
     let config = RuntimeConfig::default();
     let bind_address = config.server_addr();
+    let runtime_config = web::Data::new(config.clone());
     let classifier = web::Data::new(WasteClassifier::new(config.clone()));
     let artifact_store = web::Data::new(ArtifactStore::new(config.clone()));
     let job_manager = web::Data::new(JobManager::new(config));
 
     HttpServer::new(move || {
         App::new()
+            .app_data(runtime_config.clone())
             .app_data(classifier.clone())
             .app_data(artifact_store.clone())
             .app_data(job_manager.clone())
@@ -755,6 +813,8 @@ async fn main() -> std::io::Result<()> {
             .service(artifacts_experiment_spec)
             .service(dashboard_summary)
             .service(dataset_image)
+            .service(cluster_review)
+            .service(save_cluster_review)
             .service(artifacts_dataset)
             .service(artifacts_training)
             .service(artifacts_evaluation)

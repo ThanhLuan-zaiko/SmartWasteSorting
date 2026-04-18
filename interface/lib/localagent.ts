@@ -139,6 +139,53 @@ export type PipelineFormState = {
   no_progress: boolean;
 };
 
+export type ClusterReviewStatus = "labeled" | "unlabeled" | "excluded";
+
+export type ClusterReviewRepresentative = {
+  sample_id: string;
+  relative_path: string;
+  label: string;
+  label_source: string;
+  annotation_status: string;
+  review_status: string;
+  cluster_distance?: number | null;
+};
+
+export type ClusterReviewCluster = {
+  cluster_id: number;
+  cluster_size: number;
+  outlier_count: number;
+  representative_sample_ids: string;
+  representative_paths: string;
+  current_majority_label?: string | null;
+  label: string;
+  status: ClusterReviewStatus;
+  notes: string;
+  representatives: ClusterReviewRepresentative[];
+};
+
+export type ClusterReviewResponse = {
+  review_file: string;
+  cluster_count: number;
+  reviewed_count: number;
+  stale_reset_count: number;
+  clusters: ClusterReviewCluster[];
+};
+
+export type ClusterReviewSaveRequest = {
+  review_file?: string;
+  clusters: Array<{
+    cluster_id: number;
+    cluster_size: number;
+    outlier_count: number;
+    representative_sample_ids: string;
+    representative_paths: string;
+    label?: string;
+    status: ClusterReviewStatus;
+    notes?: string;
+  }>;
+};
+
 export const DATASET_ACTIONS = [
   "run-all",
   "export-labeling-template",

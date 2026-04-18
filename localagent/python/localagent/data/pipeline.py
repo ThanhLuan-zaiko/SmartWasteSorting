@@ -267,10 +267,18 @@ class DatasetPipeline:
         output_path: Path | None = None,
     ) -> dict[str, Any]:
         frame = self.load_manifest()
-        rows = self._build_cluster_review_rows(frame)
+        destination = output_path or self.config.cluster_review_template_path
+        existing_rows = (
+            self._load_existing_cluster_review_rows(destination)
+            if destination.exists()
+            else {}
+        )
+        rows, stale_reset_count = self._build_cluster_review_rows(
+            frame,
+            existing_rows=existing_rows,
+        )
         if not rows:
             raise ValueError("No cluster assignments are available. Run `cluster` first.")
-        destination = output_path or self.config.cluster_review_template_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -292,13 +300,28 @@ class DatasetPipeline:
         return {
             "review_path": str(destination),
             "cluster_count": len(rows),
+            "stale_reset_count": stale_reset_count,
             "manifest_path": str(self.config.manifest_path),
         }
 
     def promote_cluster_labels(self, review_file: Path) -> dict[str, Any]:
         frame = self.load_manifest()
-        assignments = self._load_cluster_review_assignments(review_file)
+        current_rows = self._build_cluster_review_rows(frame)[0]
+        current_rows_by_cluster = {
+            int(row["cluster_id"]): row for row in current_rows if row.get("cluster_id")
+        }
+        assignments, stale_cluster_ids = self._load_cluster_review_assignments(
+            review_file,
+            current_rows_by_cluster=current_rows_by_cluster,
+        )
         if not assignments:
+            if stale_cluster_ids:
+                stale_preview = ", ".join(str(cluster_id) for cluster_id in stale_cluster_ids[:5])
+                raise ValueError(
+                    "No current cluster review rows found in "
+                    f"{review_file}. Stale cluster reviews: {stale_preview}. "
+                    "Re-export or reload cluster review and try again."
+                )
             raise ValueError(f"No cluster review rows found in {review_file}")
 
         updated_records: list[dict[str, Any]] = []
@@ -356,6 +379,7 @@ class DatasetPipeline:
             "clusters_applied": len(touched_clusters),
             "promoted_rows": promoted_rows,
             "excluded_rows": excluded_rows,
+            "stale_cluster_count": len(stale_cluster_ids),
             "training_ready_files": int(report_summary["training_ready_files"]),
         }
 
@@ -855,8 +879,14 @@ class DatasetPipeline:
             records.append(record)
         return self.assign_splits(self._frame_from_records(records))
 
-    def _build_cluster_review_rows(self, frame: pl.DataFrame) -> list[dict[str, str]]:
+    def _build_cluster_review_rows(
+        self,
+        frame: pl.DataFrame,
+        *,
+        existing_rows: dict[int, dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, str]], int]:
         rows: list[dict[str, str]] = []
+        stale_reset_count = 0
         grouped_rows = self._cluster_groups(frame)
 
         for cluster_id in sorted(grouped_rows):
@@ -873,26 +903,38 @@ class DatasetPipeline:
                 if label_counts
                 else ""
             )
-            rows.append(
-                {
-                    "cluster_id": str(cluster_id),
-                    "cluster_size": str(len(members)),
-                    "outlier_count": str(
-                        sum(1 for member in members if member["is_cluster_outlier"])
-                    ),
-                    "representative_sample_ids": "|".join(
-                        str(member["sample_id"]) for member in representative_members
-                    ),
-                    "representative_paths": "|".join(
-                        str(member["relative_path"]) for member in representative_members
-                    ),
-                    "current_majority_label": majority_label,
-                    "label": "",
-                    "status": "unlabeled",
-                    "notes": "",
-                }
-            )
-        return rows
+            row = {
+                "cluster_id": str(cluster_id),
+                "cluster_size": str(len(members)),
+                "outlier_count": str(
+                    sum(1 for member in members if member["is_cluster_outlier"])
+                ),
+                "representative_sample_ids": "|".join(
+                    str(member["sample_id"]) for member in representative_members
+                ),
+                "representative_paths": "|".join(
+                    str(member["relative_path"]) for member in representative_members
+                ),
+                "current_majority_label": majority_label,
+                "label": "",
+                "status": "unlabeled",
+                "notes": "",
+            }
+            existing_row = (existing_rows or {}).get(cluster_id)
+            if existing_row is not None:
+                if self._cluster_review_row_is_current(existing_row, row):
+                    label_text = str(existing_row.get("label", "") or "").strip()
+                    status = self._normalize_annotation_status(
+                        existing_row.get("status"),
+                        label_text=label_text,
+                    )
+                    row["status"] = status
+                    row["label"] = self._normalize_label(label_text) if status == "labeled" else ""
+                    row["notes"] = str(existing_row.get("notes", "") or "")
+                else:
+                    stale_reset_count += 1
+            rows.append(row)
+        return rows, stale_reset_count
 
     def _cluster_groups(self, frame: pl.DataFrame) -> dict[int, list[dict[str, Any]]]:
         clustered_rows = [
@@ -1126,14 +1168,28 @@ class DatasetPipeline:
             }
         return assignments
 
-    def _load_cluster_review_assignments(self, review_file: Path) -> dict[int, dict[str, Any]]:
+    def _load_cluster_review_assignments(
+        self,
+        review_file: Path,
+        *,
+        current_rows_by_cluster: dict[int, dict[str, str]] | None = None,
+    ) -> tuple[dict[int, dict[str, Any]], list[int]]:
         rows = self._read_label_csv(review_file)
         assignments: dict[int, dict[str, Any]] = {}
+        stale_cluster_ids: list[int] = []
         for row in rows:
             raw_cluster_id = str(row.get("cluster_id", "")).strip()
             if not raw_cluster_id:
                 continue
             cluster_id = int(raw_cluster_id)
+            current_row = (current_rows_by_cluster or {}).get(cluster_id)
+            if current_rows_by_cluster is not None:
+                if current_row is None:
+                    stale_cluster_ids.append(cluster_id)
+                    continue
+                if not self._cluster_review_row_is_current(row, current_row):
+                    stale_cluster_ids.append(cluster_id)
+                    continue
             label_text = str(row.get("label", "") or "").strip()
             status = self._normalize_annotation_status(
                 row.get("status"),
@@ -1153,7 +1209,35 @@ class DatasetPipeline:
                 "label": normalized_label,
                 "annotation_status": status,
             }
-        return assignments
+        stale_cluster_ids = sorted(set(stale_cluster_ids))
+        return assignments, stale_cluster_ids
+
+    def _load_existing_cluster_review_rows(self, review_file: Path) -> dict[int, dict[str, Any]]:
+        rows = self._read_label_csv(review_file)
+        existing_rows: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            raw_cluster_id = str(row.get("cluster_id", "")).strip()
+            if not raw_cluster_id:
+                continue
+            existing_rows[int(raw_cluster_id)] = dict(row)
+        return existing_rows
+
+    def _cluster_review_row_is_current(
+        self,
+        review_row: dict[str, Any],
+        current_row: dict[str, Any],
+    ) -> bool:
+        return self._cluster_review_fingerprint(review_row) == self._cluster_review_fingerprint(
+            current_row
+        )
+
+    def _cluster_review_fingerprint(self, row: dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            str(row.get("cluster_id", "")).strip(),
+            str(row.get("cluster_size", "")).strip(),
+            str(row.get("outlier_count", "")).strip(),
+            str(row.get("representative_sample_ids", "")).strip(),
+        )
 
     def _normalize_annotation_status(self, value: Any, *, label_text: str) -> str:
         if value is None or str(value).strip() == "":

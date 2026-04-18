@@ -1,30 +1,52 @@
 "use client";
 
-import Image from "next/image";
-import { HiBeaker, HiOutlineSquares2X2, HiSparkles } from "react-icons/hi2";
+import { useEffect, useMemo, useState } from "react";
 
+import { DiscoveryControls } from "@/components/dashboard/discovery/discovery-controls";
+import { DiscoveryOverview } from "@/components/dashboard/discovery/discovery-overview";
+import {
+  CLUSTER_REQUIRED_ACTIONS,
+  cloneReviewClusters,
+  EMBEDDING_REQUIRED_ACTIONS,
+} from "@/components/dashboard/discovery/discovery-shared";
+import { ClusterReviewSection } from "@/components/dashboard/discovery/cluster-review-section";
 import { useLocalAgent } from "@/components/localagent-provider";
 import { useThemeMode } from "@/components/theme-provider";
 import { Panel } from "@/components/ui/primitives";
-import { API_PREFIX, asArray, asObject, DISCOVERY_ACTIONS } from "@/lib/localagent";
-
-const EMBEDDING_REQUIRED_ACTIONS = new Set(["cluster", "export-cluster-review", "promote-cluster-labels"]);
-const CLUSTER_REQUIRED_ACTIONS = new Set(["export-cluster-review", "promote-cluster-labels"]);
-
-function buildDatasetImageUrl(relativePath: string): string {
-  return `${API_PREFIX}/dataset/image?relative_path=${encodeURIComponent(relativePath)}`;
-}
+import {
+  asObject,
+  isActiveJobStatus,
+  type ClusterReviewCluster,
+  type ClusterReviewStatus,
+} from "@/lib/localagent";
 
 export function DiscoveryStudio() {
   const { isDark } = useThemeMode();
   const {
     runDetail,
+    jobs,
     pipelineForm,
     pipelineCatalog,
     isSubmitting,
+    clusterReview,
+    clusterReviewError,
+    isClusterReviewLoading,
+    isClusterReviewSaving,
     setPipelineField,
+    reloadClusterReview,
+    saveClusterReview,
     submitPipeline,
   } = useLocalAgent();
+
+  const [draftClusters, setDraftClusters] = useState<ClusterReviewCluster[]>([]);
+  const [isDirty, setIsDirty] = useState(false);
+  const [selectedClusterIds, setSelectedClusterIds] = useState<Set<number>>(new Set());
+
+  useEffect(() => {
+    setDraftClusters(clusterReview ? cloneReviewClusters(clusterReview.clusters) : []);
+    setIsDirty(false);
+    setSelectedClusterIds(new Set());
+  }, [clusterReview]);
 
   const fieldClass = [
     "min-h-12 rounded-2xl border px-4 py-3 text-sm outline-none transition",
@@ -53,24 +75,134 @@ export function DiscoveryStudio() {
       ? datasetSummary.cluster_outlier_files
       : 0;
   const clusterReady = datasetSummary?.cluster_summary_exists === true || clusteredFiles > 0;
-  const clusterPreviewTotal =
-    typeof datasetSummary?.cluster_preview_total === "number"
-      ? datasetSummary.cluster_preview_total
-      : 0;
-  const clusterPreviewTruncated = datasetSummary?.cluster_preview_truncated === true;
-  const clusterPreviews = asArray(datasetSummary?.cluster_previews).flatMap((value) => {
-    const preview = asObject(value);
-    return preview ? [preview] : [];
-  });
   const acceptedSourcesSummary = Object.entries(acceptedLabelSourceCounts ?? {})
     .map(([label, count]) => `${label}: ${count}`)
     .join(", ");
   const trainableLabelsSummary = Object.entries(trainableLabelCounts ?? {})
     .map(([label, count]) => `${label}: ${count}`)
     .join(", ");
-  const reviewSummary = Object.entries(reviewStatusCounts ?? {})
+  const manifestReviewSummary = Object.entries(reviewStatusCounts ?? {})
     .map(([label, count]) => `${label}: ${count}`)
     .join(", ");
+
+  const activeDatasetJob = useMemo(
+    () =>
+      jobs.find(
+        (job) => job.job_type === "dataset_pipeline" && isActiveJobStatus(job.status),
+      ) ?? null,
+    [jobs],
+  );
+  const reviewedClusterCount = draftClusters.filter(
+    (cluster) => cluster.status !== "unlabeled",
+  ).length;
+  const labeledClusterCount = draftClusters.filter(
+    (cluster) => cluster.status === "labeled",
+  ).length;
+  const excludedClusterCount = draftClusters.filter(
+    (cluster) => cluster.status === "excluded",
+  ).length;
+  const invalidLabeledClusters = draftClusters.filter(
+    (cluster) => cluster.status === "labeled" && !cluster.label.trim(),
+  ).length;
+
+  function updateCluster(
+    clusterId: number,
+    updater: (cluster: ClusterReviewCluster) => ClusterReviewCluster,
+  ) {
+    setDraftClusters((current) =>
+      current.map((cluster) =>
+        cluster.cluster_id === clusterId ? updater(cluster) : cluster,
+      ),
+    );
+    setIsDirty(true);
+  }
+
+  function toggleClusterSelection(clusterId: number) {
+    setSelectedClusterIds((current) => {
+      const next = new Set(current);
+      if (next.has(clusterId)) {
+        next.delete(clusterId);
+      } else {
+        next.add(clusterId);
+      }
+      return next;
+    });
+  }
+
+  function selectAllClusters() {
+    setSelectedClusterIds(new Set(draftClusters.map((cluster) => cluster.cluster_id)));
+  }
+
+  function clearClusterSelection() {
+    setSelectedClusterIds(new Set());
+  }
+
+  function handleStatusChange(clusterId: number, nextStatus: ClusterReviewStatus) {
+    updateCluster(clusterId, (cluster) => ({
+      ...cluster,
+      status: nextStatus,
+      label: nextStatus === "labeled" ? cluster.label : "",
+    }));
+  }
+
+  function handleLabelChange(clusterId: number, nextLabel: string) {
+    updateCluster(clusterId, (cluster) => ({
+      ...cluster,
+      label: nextLabel,
+      status:
+        nextLabel.trim() && cluster.status === "unlabeled" ? "labeled" : cluster.status,
+    }));
+  }
+
+  function handleNotesChange(clusterId: number, nextNotes: string) {
+    updateCluster(clusterId, (cluster) => ({
+      ...cluster,
+      notes: nextNotes,
+    }));
+  }
+
+  function handleApplyBulkReview(payload: {
+    label: string;
+    notes: string;
+    status: ClusterReviewStatus;
+  }) {
+    if (selectedClusterIds.size === 0) {
+      return;
+    }
+    const normalizedLabel = payload.status === "labeled" ? payload.label : "";
+    setDraftClusters((current) =>
+      current.map((cluster) =>
+        selectedClusterIds.has(cluster.cluster_id)
+          ? {
+              ...cluster,
+              label: normalizedLabel,
+              notes: payload.notes,
+              status: payload.status,
+            }
+          : cluster,
+      ),
+    );
+    setIsDirty(true);
+  }
+
+  async function handleSaveReview() {
+    if (activeDatasetJob || invalidLabeledClusters > 0) {
+      return;
+    }
+    await saveClusterReview({
+      review_file: pipelineForm.review_file,
+      clusters: draftClusters.map((cluster) => ({
+        cluster_id: cluster.cluster_id,
+        cluster_size: cluster.cluster_size,
+        outlier_count: cluster.outlier_count,
+        representative_sample_ids: cluster.representative_sample_ids,
+        representative_paths: cluster.representative_paths,
+        label: cluster.label,
+        status: cluster.status,
+        notes: cluster.notes,
+      })),
+    });
+  }
 
   function actionBlockReason(command: string): string | null {
     if (!datasetReady) {
@@ -82,273 +214,79 @@ export function DiscoveryStudio() {
     if (CLUSTER_REQUIRED_ACTIONS.has(command) && !clusterReady) {
       return "Run `cluster` first so cluster assignments exist in the manifest.";
     }
+    if (command === "promote-cluster-labels" && isClusterReviewLoading) {
+      return "Wait for cluster review state to finish loading.";
+    }
+    if (command === "promote-cluster-labels" && isDirty) {
+      return "Save the cluster review draft before promoting labels into the manifest.";
+    }
+    if (command === "promote-cluster-labels" && reviewedClusterCount === 0) {
+      return "Review at least one cluster below first: set Decision to labeled or excluded, click Save review, then promote labels into the manifest.";
+    }
     return null;
   }
+
+  const saveDisabledReason = activeDatasetJob
+    ? "Wait for the active dataset pipeline job to finish before saving review changes."
+    : invalidLabeledClusters > 0
+      ? "Every cluster marked labeled needs a non-empty label."
+      : null;
 
   return (
     <Panel
       title="Step 2: Discovery workflow"
-      description="Use embeddings and clusters to review visually similar images together, then promote accepted cluster labels back into the manifest."
+      description="Use embeddings and clusters to review visually similar images together, save draft decisions straight to the cluster review artifact, then promote accepted labels back into the manifest."
     >
-      <div
-        className={[
-          "rounded-[1.2rem] border px-4 py-3 text-sm leading-6",
-          isDark
-            ? "border-zinc-800 bg-zinc-950 text-zinc-300"
-            : "border-zinc-200 bg-zinc-50 text-zinc-700",
-        ].join(" ")}
-      >
-        <p>
-          Effective training mode: <span className="font-semibold">{effectiveTrainingMode}</span>.
-          {effectiveTrainingMode === "accepted_labels_only"
-            ? " Filename hints are no longer treated as train labels because accepted labels already exist."
-            : " The manifest is still relying on weak filename hints until you accept labels from review or pseudo-labeling."}
-        </p>
-        {trainableLabelsSummary ? (
-          <p className="mt-2">
-            Trainable labels: <span className="font-semibold">{trainableLabelsSummary}</span>
-          </p>
-        ) : null}
-        <p className="mt-2">
-          Clustered files: <span className="font-semibold">{clusteredFiles}</span>. Outliers:{" "}
-          <span className="font-semibold">{clusterOutliers}</span>.
-        </p>
-        {acceptedSourcesSummary ? (
-          <p className="mt-2">
-            Accepted label sources: <span className="font-semibold">{acceptedSourcesSummary}</span>
-          </p>
-        ) : null}
-        {reviewSummary ? (
-          <p className="mt-2">
-            Review status: <span className="font-semibold">{reviewSummary}</span>
-          </p>
-        ) : null}
-      </div>
+      <DiscoveryOverview
+        acceptedSourcesSummary={acceptedSourcesSummary}
+        clusterOutliers={clusterOutliers}
+        clusteredFiles={clusteredFiles}
+        effectiveTrainingMode={effectiveTrainingMode}
+        isDark={isDark}
+        manifestReviewSummary={manifestReviewSummary}
+        trainableLabelsSummary={trainableLabelsSummary}
+      />
 
-      <div className="mt-5 grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="flex flex-col gap-2">
-            <label className={labelClass} htmlFor="review_output">
-              Review export
-            </label>
-            <input
-              id="review_output"
-              className={fieldClass}
-              value={pipelineForm.review_output}
-              onChange={(event) => setPipelineField("review_output", event.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-2">
-            <label className={labelClass} htmlFor="review_file">
-              Review import
-            </label>
-            <input
-              id="review_file"
-              className={fieldClass}
-              value={pipelineForm.review_file}
-              onChange={(event) => setPipelineField("review_file", event.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-2">
-            <label className={labelClass} htmlFor="num_clusters">
-              Num clusters
-            </label>
-            <input
-              id="num_clusters"
-              className={fieldClass}
-              placeholder="auto"
-              value={pipelineForm.num_clusters}
-              onChange={(event) => setPipelineField("num_clusters", event.target.value)}
-            />
-          </div>
-        </div>
+      <DiscoveryControls
+        actionBlockReason={actionBlockReason}
+        fieldClass={fieldClass}
+        isDark={isDark}
+        isSubmitting={isSubmitting}
+        labelClass={labelClass}
+        pipelineCatalog={pipelineCatalog}
+        pipelineForm={pipelineForm}
+        setPipelineField={setPipelineField}
+        submitPipeline={submitPipeline}
+      />
 
-        <div
-          className={[
-            "rounded-[1.5rem] border p-4",
-            isDark ? "border-zinc-800 bg-zinc-950/70" : "border-zinc-200 bg-zinc-50",
-          ].join(" ")}
-        >
-          <div className="flex items-center gap-3">
-            <span
-              className={[
-                "rounded-2xl p-3 text-lg",
-                isDark ? "bg-zinc-900 text-emerald-300" : "bg-emerald-50 text-emerald-700",
-              ].join(" ")}
-            >
-              <HiOutlineSquares2X2 />
-            </span>
-            <div>
-              <p className="text-sm font-semibold">Discovery commands</p>
-              <p className="text-sm text-zinc-500">
-                {pipelineCatalog.dataset_commands
-                  .filter((command) =>
-                    DISCOVERY_ACTIONS.includes(
-                      command as (typeof DISCOVERY_ACTIONS)[number],
-                    ),
-                  )
-                  .join(", ")}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="mt-6 flex flex-wrap gap-3">
-        {DISCOVERY_ACTIONS.map((command) => {
-          const blockReason = actionBlockReason(command);
-          const isDisabled = isSubmitting !== null || blockReason !== null;
-          const isPrimary = command === "embed" || command === "cluster";
-
-          return (
-            <button
-              key={command}
-              type="button"
-              disabled={isDisabled}
-              title={blockReason ?? undefined}
-              onClick={() => void submitPipeline(command)}
-              className={[
-                "inline-flex items-center gap-2 rounded-full px-4 py-3 text-sm font-semibold transition",
-                isPrimary
-                  ? isDark
-                    ? "bg-white text-black hover:bg-zinc-200"
-                    : "bg-zinc-950 text-white hover:bg-zinc-800"
-                  : isDark
-                    ? "bg-zinc-950 text-zinc-300 hover:bg-zinc-800"
-                    : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200",
-                isDisabled ? "opacity-60" : "",
-              ].join(" ")}
-            >
-              {isPrimary ? <HiSparkles /> : <HiBeaker />}
-              {isSubmitting === command ? `Starting ${command}...` : command}
-            </button>
-          );
-        })}
-      </div>
-
-      {clusterPreviews.length > 0 ? (
-        <div className="mt-7">
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <p className="text-sm font-semibold">Representative clusters</p>
-              <p className="text-sm text-zinc-500">
-                {clusterPreviewTruncated
-                  ? `Showing ${clusterPreviews.length} of ${clusterPreviewTotal} clusters ranked by size.`
-                  : `${clusterPreviewTotal} clustered groups ready for review.`}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-4 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-            {clusterPreviews.map((clusterPreview) => {
-              const clusterId =
-                typeof clusterPreview.cluster_id === "number" ? clusterPreview.cluster_id : "N/A";
-              const clusterSize =
-                typeof clusterPreview.cluster_size === "number" ? clusterPreview.cluster_size : 0;
-              const outlierCount =
-                typeof clusterPreview.outlier_count === "number" ? clusterPreview.outlier_count : 0;
-              const majorityLabel =
-                typeof clusterPreview.current_majority_label === "string" &&
-                clusterPreview.current_majority_label.length > 0
-                  ? clusterPreview.current_majority_label
-                  : null;
-              const reviewCounts = asObject(clusterPreview.review_status_counts);
-              const representatives = asArray(clusterPreview.representatives).flatMap((value) => {
-                const representative = asObject(value);
-                return representative ? [representative] : [];
-              });
-              const reviewCountsSummary = Object.entries(reviewCounts ?? {})
-                .map(([label, count]) => `${label}: ${count}`)
-                .join(", ");
-
-              return (
-                <div
-                  key={`cluster-${clusterId}`}
-                  className={[
-                    "rounded-[1.5rem] border p-4",
-                    isDark ? "border-zinc-800 bg-zinc-950/70" : "border-zinc-200 bg-white",
-                  ].join(" ")}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold">Cluster {clusterId}</p>
-                      <p className="text-xs text-zinc-500">
-                        {clusterSize} samples • {outlierCount} outliers
-                      </p>
-                    </div>
-                    <span
-                      className={[
-                        "rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em]",
-                        majorityLabel
-                          ? isDark
-                            ? "bg-emerald-950 text-emerald-300"
-                            : "bg-emerald-50 text-emerald-700"
-                          : isDark
-                            ? "bg-zinc-900 text-zinc-400"
-                            : "bg-zinc-100 text-zinc-500",
-                      ].join(" ")}
-                    >
-                      {majorityLabel ?? "No accepted label"}
-                    </span>
-                  </div>
-
-                  {reviewCountsSummary ? (
-                    <p className="mt-3 text-xs text-zinc-500">Review: {reviewCountsSummary}</p>
-                  ) : null}
-
-                  <div className="mt-4 grid grid-cols-2 gap-3">
-                    {representatives.map((representative) => {
-                      const relativePath =
-                        typeof representative.relative_path === "string"
-                          ? representative.relative_path
-                          : "";
-                      const label =
-                        typeof representative.label === "string" ? representative.label : "unknown";
-                      const labelSource =
-                        typeof representative.label_source === "string"
-                          ? representative.label_source
-                          : "unknown";
-                      const reviewStatus =
-                        typeof representative.review_status === "string"
-                          ? representative.review_status
-                          : "unreviewed";
-
-                      return (
-                        <div key={relativePath} className="min-w-0">
-                          <div
-                            className={[
-                              "aspect-square overflow-hidden rounded-[1.2rem] border",
-                              isDark ? "border-zinc-800 bg-zinc-900" : "border-zinc-200 bg-zinc-50",
-                            ].join(" ")}
-                          >
-                            {relativePath ? (
-                              <div className="relative h-full w-full">
-                                <Image
-                                  src={buildDatasetImageUrl(relativePath)}
-                                  alt={relativePath}
-                                  fill
-                                  unoptimized
-                                  sizes="(min-width: 1536px) 180px, (min-width: 1024px) 220px, 45vw"
-                                  className="object-cover"
-                                />
-                              </div>
-                            ) : null}
-                          </div>
-                          <p className="mt-2 break-all text-[11px] text-zinc-500">{relativePath}</p>
-                          <p className="mt-1 text-xs font-semibold">
-                            {label} <span className="font-normal text-zinc-500">via {labelSource}</span>
-                          </p>
-                          <p className="text-[11px] text-zinc-500">{reviewStatus}</p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
+      <ClusterReviewSection
+        activeDatasetJob={activeDatasetJob}
+        clusterReady={clusterReady}
+        clusterReview={clusterReview}
+        clusterReviewError={clusterReviewError}
+        draftClusters={draftClusters}
+        excludedClusterCount={excludedClusterCount}
+        fieldClass={fieldClass}
+        invalidLabeledClusters={invalidLabeledClusters}
+        isClusterReviewLoading={isClusterReviewLoading}
+        isClusterReviewSaving={isClusterReviewSaving}
+        isDark={isDark}
+        isDirty={isDirty}
+        labelClass={labelClass}
+        labeledClusterCount={labeledClusterCount}
+        onApplyBulk={handleApplyBulkReview}
+        onLabelChange={handleLabelChange}
+        onNotesChange={handleNotesChange}
+        onClearSelection={clearClusterSelection}
+        onReload={reloadClusterReview}
+        onSave={handleSaveReview}
+        onSelectAll={selectAllClusters}
+        onStatusChange={handleStatusChange}
+        onToggleSelection={toggleClusterSelection}
+        reviewedClusterCount={reviewedClusterCount}
+        saveDisabledReason={saveDisabledReason}
+        selectedClusterIds={selectedClusterIds}
+      />
     </Panel>
   );
 }

@@ -66,6 +66,17 @@ impl JobManager {
         jobs
     }
 
+    pub fn has_active_job_type(&self, job_type: &str) -> bool {
+        self.jobs
+            .lock()
+            .expect("job registry mutex poisoned")
+            .values()
+            .any(|job| {
+                job.job_type == job_type
+                    && matches!(job.status, JobStatus::Pending | JobStatus::Running)
+            })
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<JobStreamEvent> {
         self.events.subscribe()
     }
