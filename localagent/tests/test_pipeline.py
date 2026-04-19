@@ -8,8 +8,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import polars as pl
+import pytest
 from localagent.config import DatasetPipelineConfig
 from localagent.data import DatasetPipeline
+from localagent.data.pipeline import main as dataset_cli_main
+from localagent.training.train import main as training_cli_main
 
 
 def _write_rgb_image(path: Path, width: int, height: int, value: int) -> None:
@@ -484,3 +487,52 @@ def test_promote_cluster_labels_skips_stale_review_rows(tmp_path: Path) -> None:
     assert promote_summary["stale_cluster_count"] == 1
     assert validation["effective_training_mode"] == "accepted_labels_only"
     assert promoted_labels == {"glass"}
+
+
+def test_discovery_cli_requires_completed_step_one(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="Step 1"):
+        dataset_cli_main(
+            [
+                "embed",
+                "--raw-dir",
+                str(config.raw_dataset_dir),
+                "--manifest-dir",
+                str(config.manifest_dir),
+                "--report-dir",
+                str(config.report_dir),
+                "--no-progress",
+            ]
+        )
+
+
+def test_training_cli_requires_completed_step_two(tmp_path: Path) -> None:
+    config = _build_config(tmp_path)
+    config.show_progress = False
+    config.raw_dataset_dir.mkdir(parents=True)
+
+    for file_name, value in (
+        ("alpha_1.jpg", 10),
+        ("alpha_2.jpg", 15),
+        ("beta_1.jpg", 220),
+        ("beta_2.jpg", 225),
+    ):
+        _write_rgb_image(config.raw_dataset_dir / file_name, width=64, height=64, value=value)
+
+    pipeline = DatasetPipeline(config)
+    pipeline.run_all()
+    pipeline.embed_dataset()
+    pipeline.cluster_dataset(requested_clusters=2)
+    pipeline.export_cluster_review()
+
+    with pytest.raises(RuntimeError, match="Step 2"):
+        training_cli_main(
+            [
+                "summary",
+                "--manifest",
+                str(config.manifest_path),
+                "--no-progress",
+            ]
+        )

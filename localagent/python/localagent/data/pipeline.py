@@ -18,6 +18,17 @@ import polars as pl
 from localagent.config import DatasetPipelineConfig
 from localagent.data.discovery import EmbeddingArtifact, cluster_embeddings, extract_embeddings
 from localagent.utils import TerminalProgressBar
+from localagent.workflow import (
+    CLUSTER_REQUIRED_MESSAGE,
+    EMBED_REQUIRED_MESSAGE,
+    PROMOTE_REQUIRED_MESSAGE,
+    STEP1_REQUIRED_MESSAGE,
+    accepted_cluster_review_labels,
+    cluster_ready,
+    embedding_artifact_exists,
+    load_dataset_summary,
+    manifest_summary_complete,
+)
 
 MANIFEST_SCHEMA: dict[str, pl.DataType] = {
     "sample_id": pl.String,
@@ -567,6 +578,63 @@ class DatasetPipeline:
             "warnings": warnings,
         }
         return summary
+
+    def workflow_state(self, review_file: Path | None = None) -> dict[str, Any]:
+        summary = load_dataset_summary(self.config.summary_path)
+        step1_completed = manifest_summary_complete(
+            self.config.manifest_path,
+            self.config.summary_path,
+        )
+        cluster_is_ready = cluster_ready(
+            summary,
+            cluster_summary_path=self.config.cluster_summary_path,
+        )
+        reviewed_cluster_count = (
+            self._reviewed_cluster_count(review_file or self.config.cluster_review_template_path)
+            if step1_completed and cluster_is_ready
+            else 0
+        )
+        return {
+            "step1_completed": step1_completed,
+            "embedding_artifact_exists": embedding_artifact_exists(
+                summary,
+                embeddings_path=self.config.embeddings_path,
+            ),
+            "cluster_ready": cluster_is_ready,
+            "reviewed_cluster_count": reviewed_cluster_count,
+            "accepted_cluster_review_labels": accepted_cluster_review_labels(summary),
+        }
+
+    def validate_discovery_command(
+        self,
+        command: str,
+        *,
+        review_file: Path | None = None,
+    ) -> None:
+        state = self.workflow_state(review_file=review_file)
+        if not state["step1_completed"]:
+            raise RuntimeError(
+                f"Discovery command `{command}` requires Step 1 to be complete. "
+                f"{STEP1_REQUIRED_MESSAGE}"
+            )
+        if command == "cluster" and not state["embedding_artifact_exists"]:
+            raise RuntimeError(
+                f"Discovery command `{command}` requires `embed` first. "
+                f"{EMBED_REQUIRED_MESSAGE}"
+            )
+        if (
+            command in {"export-cluster-review", "promote-cluster-labels"}
+            and not state["cluster_ready"]
+        ):
+            raise RuntimeError(
+                f"Discovery command `{command}` requires `cluster` first. "
+                f"{CLUSTER_REQUIRED_MESSAGE}"
+            )
+        if command == "promote-cluster-labels" and state["reviewed_cluster_count"] == 0:
+            raise RuntimeError(
+                f"Discovery command `{command}` requires at least one saved cluster decision. "
+                f"{PROMOTE_REQUIRED_MESSAGE}"
+            )
 
     def run_all(self) -> pl.DataFrame:
         frame = self.scan()
@@ -1222,6 +1290,19 @@ class DatasetPipeline:
             existing_rows[int(raw_cluster_id)] = dict(row)
         return existing_rows
 
+    def _reviewed_cluster_count(self, review_file: Path) -> int:
+        if not review_file.exists():
+            return 0
+        current_rows = self._build_cluster_review_rows(self.load_manifest())[0]
+        current_rows_by_cluster = {
+            int(row["cluster_id"]): row for row in current_rows if row.get("cluster_id")
+        }
+        assignments, _ = self._load_cluster_review_assignments(
+            review_file,
+            current_rows_by_cluster=current_rows_by_cluster,
+        )
+        return len(assignments)
+
     def _cluster_review_row_is_current(
         self,
         review_row: dict[str, Any],
@@ -1349,6 +1430,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     pipeline = DatasetPipeline(build_config(args))
+
+    if args.command in {"embed", "cluster", "export-cluster-review", "promote-cluster-labels"}:
+        pipeline.validate_discovery_command(
+            args.command,
+            review_file=getattr(args, "review_file", None),
+        )
 
     if args.command == "scan":
         frame = pipeline.run_scan()

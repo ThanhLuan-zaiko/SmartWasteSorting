@@ -14,6 +14,7 @@ import {
   type RunIndexEntry,
   type TrainingFormState,
   type TrainingPreset,
+  type WorkflowStateResponse,
 } from "@/lib/localagent";
 
 export type LocalAgentContextValue = {
@@ -24,6 +25,7 @@ export type LocalAgentContextValue = {
   compareExperiment: string;
   runDetail: RunDetailResponse | null;
   comparison: CompareResponse | null;
+  workflowState: WorkflowStateResponse | null;
   activeJobId: string | null;
   activeLogs: JobLogsResponse | null;
   clusterReview: ClusterReviewResponse | null;

@@ -7,6 +7,12 @@ from pathlib import Path
 
 from localagent.config import AgentPaths, TrainingConfig
 from localagent.training import SUPPORTED_TRAINING_BACKENDS, WasteTrainer, compare_benchmark_reports
+from localagent.workflow import (
+    STEP2_REQUIRED_MESSAGE,
+    accepted_cluster_review_labels,
+    load_dataset_summary,
+    summary_path_from_manifest,
+)
 
 TRAINING_PRESETS: dict[str, dict[str, object]] = {
     "cpu_fast": {
@@ -204,6 +210,12 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
     )
 
 
+def _ensure_step_three_unlocked(manifest_path: Path) -> None:
+    summary = load_dataset_summary(summary_path_from_manifest(manifest_path))
+    if accepted_cluster_review_labels(summary) == 0:
+        raise RuntimeError(STEP2_REQUIRED_MESSAGE)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -213,7 +225,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
-    trainer = WasteTrainer(AgentPaths().ensure_layout(), build_config(args))
+    config = build_config(args)
+    _ensure_step_three_unlocked(config.manifest_path)
+    trainer = WasteTrainer(AgentPaths().ensure_layout(), config)
 
     if args.command == "summary":
         summary = trainer.summarize_training_plan()

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { DiscoveryControls } from "@/components/dashboard/discovery/discovery-controls";
 import { DiscoveryOverview } from "@/components/dashboard/discovery/discovery-overview";
@@ -17,16 +17,22 @@ import {
   asObject,
   isActiveJobStatus,
   type ClusterReviewCluster,
+  type ClusterReviewResponse,
+  type ClusterReviewSaveRequest,
   type ClusterReviewStatus,
+  type JobRecord,
+  type PipelineCatalogResponse,
+  type PipelineFormState,
+  type WorkflowStateResponse,
 } from "@/lib/localagent";
 
 export function DiscoveryStudio() {
   const { isDark } = useThemeMode();
   const {
-    runDetail,
     jobs,
     pipelineForm,
     pipelineCatalog,
+    workflowState,
     isSubmitting,
     clusterReview,
     clusterReviewError,
@@ -38,16 +44,6 @@ export function DiscoveryStudio() {
     submitPipeline,
   } = useLocalAgent();
 
-  const [draftClusters, setDraftClusters] = useState<ClusterReviewCluster[]>([]);
-  const [isDirty, setIsDirty] = useState(false);
-  const [selectedClusterIds, setSelectedClusterIds] = useState<Set<number>>(new Set());
-
-  useEffect(() => {
-    setDraftClusters(clusterReview ? cloneReviewClusters(clusterReview.clusters) : []);
-    setIsDirty(false);
-    setSelectedClusterIds(new Set());
-  }, [clusterReview]);
-
   const fieldClass = [
     "min-h-12 rounded-2xl border px-4 py-3 text-sm outline-none transition",
     isDark
@@ -56,14 +52,10 @@ export function DiscoveryStudio() {
   ].join(" ");
   const labelClass = "text-xs font-semibold uppercase tracking-[0.22em] text-zinc-500";
 
-  const dashboardSummary = asObject(runDetail?.dashboard_summary);
-  const status = asObject(dashboardSummary?.status);
-  const datasetSummary = asObject(dashboardSummary?.dataset_summary);
+  const datasetSummary = asObject(workflowState?.dataset_summary);
   const reviewStatusCounts = asObject(datasetSummary?.review_status_counts);
   const trainableLabelCounts = asObject(datasetSummary?.trainable_label_counts);
   const acceptedLabelSourceCounts = asObject(datasetSummary?.accepted_label_source_counts);
-  const datasetReady = status?.dataset_ready === true;
-  const embeddingExists = datasetSummary?.embedding_artifact_exists === true;
   const effectiveTrainingMode =
     typeof datasetSummary?.effective_training_mode === "string"
       ? datasetSummary.effective_training_mode
@@ -74,7 +66,6 @@ export function DiscoveryStudio() {
     typeof datasetSummary?.cluster_outlier_files === "number"
       ? datasetSummary.cluster_outlier_files
       : 0;
-  const clusterReady = datasetSummary?.cluster_summary_exists === true || clusteredFiles > 0;
   const acceptedSourcesSummary = Object.entries(acceptedLabelSourceCounts ?? {})
     .map(([label, count]) => `${label}: ${count}`)
     .join(", ");
@@ -92,6 +83,105 @@ export function DiscoveryStudio() {
       ) ?? null,
     [jobs],
   );
+  const draftResetKey = useMemo(() => {
+    if (!clusterReview) {
+      return "cluster-review:empty";
+    }
+    const clusterFingerprint = clusterReview.clusters
+      .map((cluster) => `${cluster.cluster_id}:${cluster.status}:${cluster.label}:${cluster.notes}`)
+      .join("|");
+    return `${clusterReview.review_file}:${clusterReview.stale_reset_count}:${clusterFingerprint}`;
+  }, [clusterReview]);
+
+  return (
+    <Panel
+      title="Step 2: Discovery workflow"
+      description="Use embeddings and clusters to review visually similar images together, save draft decisions straight to the cluster review artifact, then promote accepted labels back into the manifest."
+    >
+      <DiscoveryOverview
+        acceptedSourcesSummary={acceptedSourcesSummary}
+        clusterOutliers={clusterOutliers}
+        clusteredFiles={clusteredFiles}
+        effectiveTrainingMode={effectiveTrainingMode}
+        isDark={isDark}
+        manifestReviewSummary={manifestReviewSummary}
+        trainableLabelsSummary={trainableLabelsSummary}
+      />
+
+      <DiscoveryWorkflowBody
+        key={draftResetKey}
+        activeDatasetJob={activeDatasetJob}
+        clusterReview={clusterReview}
+        clusterReviewError={clusterReviewError}
+        fieldClass={fieldClass}
+        isClusterReviewLoading={isClusterReviewLoading}
+        isClusterReviewSaving={isClusterReviewSaving}
+        isDark={isDark}
+        isSubmitting={isSubmitting}
+        labelClass={labelClass}
+        pipelineCatalog={pipelineCatalog}
+        pipelineForm={pipelineForm}
+        reloadClusterReview={reloadClusterReview}
+        saveClusterReview={saveClusterReview}
+        setPipelineField={setPipelineField}
+        submitPipeline={submitPipeline}
+        workflowState={workflowState}
+      />
+    </Panel>
+  );
+}
+
+type DiscoveryWorkflowBodyProps = {
+  activeDatasetJob: JobRecord | null;
+  clusterReview: ClusterReviewResponse | null;
+  clusterReviewError: string | null;
+  fieldClass: string;
+  isClusterReviewLoading: boolean;
+  isClusterReviewSaving: boolean;
+  isDark: boolean;
+  isSubmitting: string | null;
+  labelClass: string;
+  pipelineCatalog: PipelineCatalogResponse;
+  pipelineForm: PipelineFormState;
+  reloadClusterReview: (reviewFile?: string) => Promise<void>;
+  saveClusterReview: (
+    payload: ClusterReviewSaveRequest,
+  ) => Promise<ClusterReviewResponse | null>;
+  setPipelineField: <K extends keyof PipelineFormState>(
+    field: K,
+    value: PipelineFormState[K],
+  ) => void;
+  submitPipeline: (command: string) => Promise<void>;
+  workflowState: WorkflowStateResponse | null;
+};
+
+function DiscoveryWorkflowBody({
+  activeDatasetJob,
+  clusterReview,
+  clusterReviewError,
+  fieldClass,
+  isClusterReviewLoading,
+  isClusterReviewSaving,
+  isDark,
+  isSubmitting,
+  labelClass,
+  pipelineCatalog,
+  pipelineForm,
+  reloadClusterReview,
+  saveClusterReview,
+  setPipelineField,
+  submitPipeline,
+  workflowState,
+}: DiscoveryWorkflowBodyProps) {
+  const [draftClusters, setDraftClusters] = useState<ClusterReviewCluster[]>(() =>
+    clusterReview ? cloneReviewClusters(clusterReview.clusters) : [],
+  );
+  const [isDirty, setIsDirty] = useState(false);
+  const [selectedClusterIds, setSelectedClusterIds] = useState<Set<number>>(new Set());
+
+  const datasetReady = workflowState?.steps.dataset?.completed === true;
+  const embeddingExists = workflowState?.status.embedding_artifact_exists === true;
+  const clusterReady = workflowState?.status.cluster_ready === true;
   const reviewedClusterCount = draftClusters.filter(
     (cluster) => cluster.status !== "unlabeled",
   ).length;
@@ -205,20 +295,27 @@ export function DiscoveryStudio() {
   }
 
   function actionBlockReason(command: string): string | null {
+    if (!workflowState) {
+      return "Checking workflow state.";
+    }
     if (!datasetReady) {
-      return "Run the dataset pipeline first so the manifest exists before discovery steps.";
-    }
-    if (EMBEDDING_REQUIRED_ACTIONS.has(command) && !embeddingExists) {
-      return "Run `embed` first to build image similarity vectors.";
-    }
-    if (CLUSTER_REQUIRED_ACTIONS.has(command) && !clusterReady) {
-      return "Run `cluster` first so cluster assignments exist in the manifest.";
+      return workflowState.steps.discovery?.reason ?? "Complete Step 1 first.";
     }
     if (command === "promote-cluster-labels" && isClusterReviewLoading) {
       return "Wait for cluster review state to finish loading.";
     }
     if (command === "promote-cluster-labels" && isDirty) {
       return "Save the cluster review draft before promoting labels into the manifest.";
+    }
+    const workflowReason = workflowState.commands[command]?.reason ?? null;
+    if (workflowReason) {
+      return workflowReason;
+    }
+    if (EMBEDDING_REQUIRED_ACTIONS.has(command) && !embeddingExists) {
+      return "Run `embed` first to build image similarity vectors.";
+    }
+    if (CLUSTER_REQUIRED_ACTIONS.has(command) && !clusterReady) {
+      return "Run `cluster` first so cluster assignments exist in the manifest.";
     }
     if (command === "promote-cluster-labels" && reviewedClusterCount === 0) {
       return "Review at least one cluster below first: set Decision to labeled or excluded, click Save review, then promote labels into the manifest.";
@@ -233,20 +330,7 @@ export function DiscoveryStudio() {
       : null;
 
   return (
-    <Panel
-      title="Step 2: Discovery workflow"
-      description="Use embeddings and clusters to review visually similar images together, save draft decisions straight to the cluster review artifact, then promote accepted labels back into the manifest."
-    >
-      <DiscoveryOverview
-        acceptedSourcesSummary={acceptedSourcesSummary}
-        clusterOutliers={clusterOutliers}
-        clusteredFiles={clusteredFiles}
-        effectiveTrainingMode={effectiveTrainingMode}
-        isDark={isDark}
-        manifestReviewSummary={manifestReviewSummary}
-        trainableLabelsSummary={trainableLabelsSummary}
-      />
-
+    <>
       <DiscoveryControls
         actionBlockReason={actionBlockReason}
         fieldClass={fieldClass}
@@ -287,6 +371,6 @@ export function DiscoveryStudio() {
         saveDisabledReason={saveDisabledReason}
         selectedClusterIds={selectedClusterIds}
       />
-    </Panel>
+    </>
   );
 }

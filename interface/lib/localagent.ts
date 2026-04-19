@@ -104,6 +104,45 @@ export type PipelineCatalogResponse = {
   training_commands: string[];
 };
 
+export type WorkflowStepState = {
+  title: string;
+  completed: boolean;
+  enabled: boolean;
+  reason?: string | null;
+};
+
+export type WorkflowCommandState = {
+  allowed: boolean;
+  reason?: string | null;
+};
+
+export type WorkflowStatus = {
+  dataset_manifest_exists: boolean;
+  dataset_summary_exists: boolean;
+  embedding_artifact_exists: boolean;
+  cluster_summary_exists: boolean;
+  cluster_ready: boolean;
+  clustered_files: number;
+  cluster_outlier_files: number;
+  reviewed_cluster_count: number;
+  cluster_review_cluster_count: number;
+  cluster_review_stale_reset_count: number;
+  cluster_review_error?: string | null;
+  cluster_review_file: string;
+  accepted_cluster_review_labels: number;
+  training_ready_files: number;
+  trainable_labels: string[];
+  effective_training_mode?: string | null;
+};
+
+export type WorkflowStateResponse = {
+  schema_version: number;
+  steps: Record<string, WorkflowStepState>;
+  commands: Record<string, WorkflowCommandState>;
+  status: WorkflowStatus;
+  dataset_summary?: JsonObject | null;
+};
+
 export type CompareResponse = {
   duration_delta_seconds?: number | null;
   fit_stage_delta_seconds?: number | null;

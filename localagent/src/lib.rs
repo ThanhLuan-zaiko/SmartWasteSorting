@@ -9,10 +9,12 @@ mod python_api;
 mod telemetry;
 mod training_cache;
 mod training_metrics;
+mod workflow;
 
 pub use artifacts::{to_api_envelope, ArtifactKind, ArtifactStore};
 pub use cluster_review::{
-    ClusterReviewError, ClusterReviewSaveRequest, ClusterReviewState, ClusterReviewStore,
+    load_review_state_from_paths, ClusterReviewError, ClusterReviewSaveRequest, ClusterReviewState,
+    ClusterReviewStore,
 };
 pub use config::RuntimeConfig;
 pub use domain::{ClassificationResult, Prediction};
@@ -24,6 +26,7 @@ pub use jobs::{
 };
 pub use telemetry::init_tracing;
 pub use training_metrics::{build_classification_report, compute_class_weight_map};
+pub use workflow::{WorkflowCommandState, WorkflowState, WorkflowStatus, WorkflowStepState};
 
 use pyo3::{prelude::*, types::PyModule, Bound};
 

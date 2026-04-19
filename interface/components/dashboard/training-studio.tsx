@@ -31,6 +31,7 @@ export function TrainingStudio() {
   const {
     runs,
     runDetail,
+    workflowState,
     trainingPresets,
     trainingForm,
     isSubmitting,
@@ -49,12 +50,12 @@ export function TrainingStudio() {
   const labelClass = "text-xs font-semibold uppercase tracking-[0.22em] text-zinc-500";
   const dashboardSummary = asObject(runDetail?.dashboard_summary);
   const status = asObject(dashboardSummary?.status);
-  const datasetSummary = asObject(dashboardSummary?.dataset_summary);
+  const datasetSummary = asObject(workflowState?.dataset_summary);
   const labelCounts = asObject(datasetSummary?.label_counts);
   const acceptedLabelSourceCounts = asObject(datasetSummary?.accepted_label_source_counts);
   const trainableLabelCounts = asObject(datasetSummary?.trainable_label_counts);
-  const datasetReady = status?.dataset_ready === true;
-  const datasetReadyKnown = typeof status?.dataset_ready === "boolean";
+  const datasetReady = workflowState?.steps.dataset?.completed === true;
+  const datasetReadyKnown = workflowState !== null;
   const trainingReady = status?.training_ready === true;
   const detectedLabels = Object.keys(labelCounts ?? {}).filter((label) => label !== "unknown");
   const trainableLabels = Object.keys(trainableLabelCounts ?? {}).filter(
@@ -69,12 +70,19 @@ export function TrainingStudio() {
       : "weak_inferred";
 
   function actionBlockReason(command: string): string | null {
+    if (!workflowState) {
+      return "Checking workflow state.";
+    }
+    const workflowReason = workflowState.commands[command]?.reason ?? null;
+    if (workflowReason) {
+      return workflowReason;
+    }
     if (
       datasetReadyKnown &&
       !datasetReady &&
       DATASET_REQUIRED_ACTIONS.has(command)
     ) {
-      return "Run dataset pipeline `run-all` first to create artifacts/manifests/dataset_manifest.parquet.";
+      return workflowState.steps.training?.reason ?? "Complete Step 2 first.";
     }
     if (
       MULTI_CLASS_REQUIRED_ACTIONS.has(command) &&
@@ -300,8 +308,8 @@ export function TrainingStudio() {
           <span className="font-semibold">
             {datasetReadyKnown ? (datasetReady ? "ready" : "missing") : "checking"}
           </span>
-          . Training steps that read the manifest are blocked until the dataset pipeline writes
-          `artifacts/manifests/dataset_manifest.parquet`.
+          . Step 3 stays locked until Step 2 discovery has been completed and promoted into the
+          manifest.
         </p>
         <p className="mt-2">
           `rust_tch` stays available for preview metadata flows such as `summary`, `export-spec`,

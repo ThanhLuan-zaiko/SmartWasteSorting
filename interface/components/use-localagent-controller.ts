@@ -1,23 +1,22 @@
 "use client";
 
-import {
-  startTransition,
-  useEffect,
-  useEffectEvent,
-  useRef,
-  useState,
-} from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
+import {
+  appendLogLine,
+  LIVE_LOG_TAIL_LINES,
+  parseJobStreamEvent,
+  sortJobsByRecency,
+  upsertJobRecord,
+} from "@/components/localagent/controller-helpers";
+import { useLocalAgentActions } from "@/components/localagent/controller-actions";
 import type { LocalAgentContextValue } from "@/components/localagent-context";
 import {
   buildJobsWebSocketUrl,
-  type ClusterReviewResponse,
-  type ClusterReviewSaveRequest,
-  type CompareResponse,
   fetchJson,
   isActiveJobStatus,
-  toNumberString,
-  type JobLogStream,
+  type ClusterReviewResponse,
+  type CompareResponse,
   type JobLogsResponse,
   type JobRecord,
   type JobsResponse,
@@ -26,68 +25,10 @@ import {
   type PipelineFormState,
   type RunDetailResponse,
   type RunIndexEntry,
-  type RunIndexResponse,
   type TrainingFormState,
   type TrainingPreset,
-  type TrainingPresetsResponse,
+  type WorkflowStateResponse,
 } from "@/lib/localagent";
-
-const LIVE_LOG_TAIL_LINES = 220;
-
-function sortJobsByRecency(jobs: JobRecord[]): JobRecord[] {
-  return [...jobs].sort((left, right) => right.created_at.localeCompare(left.created_at));
-}
-
-function upsertJobRecord(current: JobRecord[], job: JobRecord): JobRecord[] {
-  const withoutTarget = current.filter((entry) => entry.job_id !== job.job_id);
-  return sortJobsByRecency([job, ...withoutTarget]);
-}
-
-function trimLogTail(lines: string[], nextLine: string): string[] {
-  const next = [...lines, nextLine];
-  return next.length > LIVE_LOG_TAIL_LINES
-    ? next.slice(next.length - LIVE_LOG_TAIL_LINES)
-    : next;
-}
-
-function appendLogLine(
-  current: JobLogsResponse | null,
-  jobId: string,
-  stream: JobLogStream,
-  line: string,
-): JobLogsResponse {
-  const base =
-    current && current.job_id === jobId
-      ? current
-      : {
-          job_id: jobId,
-          status: "running" as const,
-          stdout: [],
-          stderr: [],
-        };
-
-  return {
-    ...base,
-    stdout: stream === "stdout" ? trimLogTail(base.stdout, line) : base.stdout,
-    stderr: stream === "stderr" ? trimLogTail(base.stderr, line) : base.stderr,
-  };
-}
-
-function parseJobStreamEvent(value: string): JobStreamEvent | null {
-  try {
-    return JSON.parse(value) as JobStreamEvent;
-  } catch {
-    return null;
-  }
-}
-
-function isClusterReviewUnavailableError(message: string): boolean {
-  return (
-    message.includes("Run `cluster` first") ||
-    message.includes("Run `run-all` first") ||
-    message.includes("No cluster assignments are available")
-  );
-}
 
 export function useLocalAgentController(): LocalAgentContextValue {
   const [runs, setRuns] = useState<RunIndexEntry[]>([]);
@@ -97,6 +38,7 @@ export function useLocalAgentController(): LocalAgentContextValue {
   const [compareExperiment, setCompareExperimentState] = useState("");
   const [runDetail, setRunDetail] = useState<RunDetailResponse | null>(null);
   const [comparison, setComparison] = useState<CompareResponse | null>(null);
+  const [workflowState, setWorkflowState] = useState<WorkflowStateResponse | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [activeLogs, setActiveLogs] = useState<JobLogsResponse | null>(null);
   const [clusterReview, setClusterReview] = useState<ClusterReviewResponse | null>(null);
@@ -139,345 +81,36 @@ export function useLocalAgentController(): LocalAgentContextValue {
     no_progress: true,
   });
 
-  async function loadCatalog() {
-    const [trainingPayload, pipelinePayload] = await Promise.all([
-      fetchJson<TrainingPresetsResponse>("/presets/training"),
-      fetchJson<PipelineCatalogResponse>("/presets/pipeline"),
-    ]);
-    setTrainingPresets(trainingPayload.presets);
-    setPipelineCatalog(pipelinePayload);
-  }
-
-  async function loadRuns() {
-    const payload = await fetchJson<RunIndexResponse>("/runs");
-    setRuns(payload.runs);
-
-    if (!selectedExperiment && payload.runs.length > 0) {
-      const initialExperiment = payload.runs[0].experiment_name;
-      setSelectedExperimentState(initialExperiment);
-      setTrainingForm((current) => ({
-        ...current,
-        experiment_name: initialExperiment,
-      }));
-    }
-
-    if (payload.runs.length > 1) {
-      const candidate = payload.runs.find(
-        (run) => run.experiment_name !== selectedExperiment,
-      );
-      if (candidate && (!compareExperiment || compareExperiment === selectedExperiment)) {
-        setCompareExperimentState(candidate.experiment_name);
-      }
-    }
-
-    return payload;
-  }
-
-  async function loadRunDetail(experimentName: string) {
-    if (!experimentName) {
-      setRunDetail(null);
-      return;
-    }
-
-    const payload = await fetchJson<RunDetailResponse>(
-      `/runs/${encodeURIComponent(experimentName)}`,
-    );
-    startTransition(() => {
-      setRunDetail(payload);
-    });
-  }
-
-  async function loadComparison(left: string, right: string) {
-    if (!left || !right || left === right) {
-      setComparison(null);
-      return;
-    }
-
-    try {
-      const payload = await fetchJson<CompareResponse>(
-        `/runs/${encodeURIComponent(left)}/compare?with=${encodeURIComponent(right)}`,
-      );
-      setComparison(payload);
-    } catch {
-      setComparison(null);
-    }
-  }
-
-  async function loadClusterReview(reviewFile = pipelineForm.review_file) {
-    setIsClusterReviewLoading(true);
-    try {
-      const query = reviewFile ? `?review_file=${encodeURIComponent(reviewFile)}` : "";
-      const payload = await fetchJson<ClusterReviewResponse>(`/cluster-review${query}`);
-      setClusterReview(payload);
-      setClusterReviewError(null);
-    } catch (error) {
-      const nextMessage =
-        error instanceof Error ? error.message : "Failed to load cluster review.";
-      setClusterReview(null);
-      setClusterReviewError(nextMessage);
-      if (!isClusterReviewUnavailableError(nextMessage)) {
-        throw error;
-      }
-    } finally {
-      setIsClusterReviewLoading(false);
-    }
-  }
-
-  async function loadJobs() {
-    const payload = await fetchJson<JobsResponse>("/jobs");
-    const nextJobs = sortJobsByRecency(payload.jobs);
-    jobsRef.current = nextJobs;
-    setJobs(nextJobs);
-
-    const runningNow = payload.jobs.some((job) => isActiveJobStatus(job.status));
-    const targetJobId = activeJobId ?? payload.jobs[0]?.job_id ?? null;
-    if (!activeJobId && targetJobId) {
-      setActiveJobId(targetJobId);
-    }
-    if (targetJobId) {
-      try {
-        const logs = await fetchJson<JobLogsResponse>(
-          `/jobs/${encodeURIComponent(targetJobId)}/logs?tail_lines=${LIVE_LOG_TAIL_LINES}`,
-        );
-        setActiveLogs(logs);
-      } catch {
-        setActiveLogs(null);
-      }
-    }
-
-    if (hadRunningJobs.current && !runningNow) {
-      await loadRuns();
-      if (selectedExperiment) {
-        await loadRunDetail(selectedExperiment);
-      }
-      if (selectedExperiment && compareExperiment) {
-        await loadComparison(selectedExperiment, compareExperiment);
-      }
-      await loadClusterReview();
-    }
-
-    hadRunningJobs.current = runningNow;
-    return payload;
-  }
-
-  async function refreshAll() {
-    try {
-      await Promise.all([loadCatalog(), loadRuns(), loadJobs()]);
-      if (selectedExperiment) {
-        await loadRunDetail(selectedExperiment);
-      }
-      if (selectedExperiment && compareExperiment) {
-        await loadComparison(selectedExperiment, compareExperiment);
-      }
-      await loadClusterReview();
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "Unable to reach localagent server.",
-      );
-    }
-  }
-
-  async function ensureRunLoaded(experimentName: string) {
-    setSelectedExperimentState(experimentName);
-    setTrainingForm((current) => ({
-      ...current,
-      experiment_name: experimentName,
-    }));
-    await loadRunDetail(experimentName);
-  }
-
-  async function reloadClusterReview(reviewFile = pipelineForm.review_file) {
-    try {
-      await loadClusterReview(reviewFile);
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "Failed to load cluster review.",
-      );
-    }
-  }
-
-  async function saveClusterReview(payload: ClusterReviewSaveRequest) {
-    setIsClusterReviewSaving(true);
-    setMessage(null);
-    try {
-      const saved = await fetchJson<ClusterReviewResponse>("/cluster-review", {
-        method: "PUT",
-        body: JSON.stringify(payload),
-      });
-      setClusterReview(saved);
-      setClusterReviewError(null);
-      setMessage(`Saved cluster review draft to ${saved.review_file}`);
-      setConnectionError(null);
-      return saved;
-    } catch (error) {
-      const nextMessage =
-        error instanceof Error ? error.message : "Failed to save cluster review.";
-      setClusterReviewError(nextMessage);
-      return null;
-    } finally {
-      setIsClusterReviewSaving(false);
-    }
-  }
-
-  async function submitPipeline(command: string) {
-    setIsSubmitting(command);
-    setMessage(null);
-    try {
-      const payload: Record<string, unknown> = {
-        command,
-        no_progress: pipelineForm.no_progress,
-      };
-      if (pipelineForm.labels_file) {
-        payload.labels_file = pipelineForm.labels_file;
-      }
-      if (pipelineForm.review_file) {
-        payload.review_file = pipelineForm.review_file;
-      }
-      if (command === "export-labeling-template" && pipelineForm.template_output) {
-        payload.output = pipelineForm.template_output;
-      }
-      if (command === "export-cluster-review" && pipelineForm.review_output) {
-        payload.output = pipelineForm.review_output;
-      }
-      if (pipelineForm.num_clusters.trim()) {
-        payload.num_clusters = toNumberString(pipelineForm.num_clusters);
-      }
-
-      const created = await fetchJson<JobRecord>("/jobs/pipeline", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      setActiveJobId(created.job_id);
-      setMessage(`Started dataset job ${created.job_id}`);
-      const jobsPayload = await fetchJson<JobsResponse>("/jobs");
-      const nextJobs = sortJobsByRecency(jobsPayload.jobs);
-      jobsRef.current = nextJobs;
-      setJobs(nextJobs);
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "Failed to create pipeline job.",
-      );
-    } finally {
-      setIsSubmitting(null);
-    }
-  }
-
-  async function submitTraining(command: string) {
-    setIsSubmitting(command);
-    setMessage(null);
-    try {
-      const basePayload: Record<string, unknown> = {
-        experiment_name: trainingForm.experiment_name,
-        training_preset: trainingForm.training_preset || undefined,
-        training_backend: trainingForm.training_backend,
-        model_name: trainingForm.model_name,
-        image_size: toNumberString(trainingForm.image_size),
-        batch_size: toNumberString(trainingForm.batch_size),
-        epochs: toNumberString(trainingForm.epochs),
-        class_bias: trainingForm.class_bias,
-        device: trainingForm.device,
-        pseudo_label_threshold: toNumberString(trainingForm.pseudo_label_threshold),
-        pseudo_label_margin: toNumberString(trainingForm.pseudo_label_margin),
-        no_progress: trainingForm.no_progress,
-      };
-
-      const endpoint = command === "benchmark" ? "/jobs/benchmark" : "/jobs/training";
-      const payload =
-        command === "benchmark"
-          ? {
-              ...basePayload,
-              compare_experiment: trainingForm.compare_experiment || undefined,
-            }
-          : {
-              ...basePayload,
-              command,
-            };
-
-      const created = await fetchJson<JobRecord>(endpoint, {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      setActiveJobId(created.job_id);
-      setSelectedExperimentState(trainingForm.experiment_name);
-      setMessage(`Started ${command} job ${created.job_id}`);
-      const jobsPayload = await fetchJson<JobsResponse>("/jobs");
-      const nextJobs = sortJobsByRecency(jobsPayload.jobs);
-      jobsRef.current = nextJobs;
-      setJobs(nextJobs);
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "Failed to create training job.",
-      );
-    } finally {
-      setIsSubmitting(null);
-    }
-  }
-
-  async function cancelActiveJob() {
-    if (!activeJobId) {
-      return;
-    }
-    try {
-      const cancelled = await fetchJson<JobRecord>(
-        `/jobs/${encodeURIComponent(activeJobId)}/cancel`,
-        { method: "POST" },
-      );
-      setMessage(`Cancelled ${cancelled.job_id}`);
-      const jobsPayload = await fetchJson<JobsResponse>("/jobs");
-      const nextJobs = sortJobsByRecency(jobsPayload.jobs);
-      jobsRef.current = nextJobs;
-      setJobs(nextJobs);
-      setConnectionError(null);
-    } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "Failed to cancel job.",
-      );
-    }
-  }
-
-  function applyPreset(presetName: string) {
-    const preset = trainingPresets[presetName];
-    setTrainingForm((current) => ({
-      ...current,
-      training_preset: presetName,
-      model_name: preset?.model_name ?? current.model_name,
-      image_size: preset?.image_size ? `${preset.image_size}` : current.image_size,
-      batch_size: preset?.batch_size ? `${preset.batch_size}` : current.batch_size,
-      class_bias: preset?.class_bias ?? current.class_bias,
-    }));
-  }
-
-  function setSelectedExperiment(value: string) {
-    setSelectedExperimentState(value);
-    setTrainingForm((current) => ({
-      ...current,
-      experiment_name: value,
-    }));
-  }
-
-  function setTrainingField<K extends keyof TrainingFormState>(
-    field: K,
-    value: TrainingFormState[K],
-  ) {
-    setTrainingForm((current) => ({
-      ...current,
-      [field]: value,
-    }));
-  }
-
-  function setPipelineField<K extends keyof PipelineFormState>(
-    field: K,
-    value: PipelineFormState[K],
-  ) {
-    setPipelineForm((current) => ({
-      ...current,
-      [field]: value,
-    }));
-  }
+  const actions = useLocalAgentActions({
+    activeJobId,
+    compareExperiment,
+    hadRunningJobs,
+    jobsRef,
+    pipelineForm,
+    selectedExperiment,
+    setActiveJobId,
+    setActiveLogs,
+    setClusterReview,
+    setClusterReviewError,
+    setComparison,
+    setConnectionError,
+    setIsClusterReviewLoading,
+    setIsClusterReviewSaving,
+    setIsSubmitting,
+    setJobs,
+    setMessage,
+    setPipelineCatalog,
+    setPipelineForm,
+    setRunDetail,
+    setRuns,
+    setSelectedExperimentState,
+    setCompareExperimentState,
+    setTrainingForm,
+    setTrainingPresets,
+    setWorkflowState,
+    trainingForm,
+    trainingPresets,
+  });
 
   const handleJobStreamEvent = useEffectEvent(async (event: JobStreamEvent) => {
     if (event.event === "snapshot") {
@@ -517,13 +150,15 @@ export function useLocalAgentController(): LocalAgentContextValue {
       }
 
       if (hadRunningJobs.current && !runningNow) {
-        await loadRuns();
+        await actions.loadRuns();
         if (selectedExperiment) {
-          await loadRunDetail(selectedExperiment);
+          await actions.loadRunDetail(selectedExperiment);
         }
         if (selectedExperiment && compareExperiment) {
-          await loadComparison(selectedExperiment, compareExperiment);
+          await actions.loadComparison(selectedExperiment, compareExperiment);
         }
+        await actions.loadClusterReview();
+        await actions.loadWorkflowState();
       }
       hadRunningJobs.current = runningNow;
       return;
@@ -558,11 +193,30 @@ export function useLocalAgentController(): LocalAgentContextValue {
   });
 
   const refreshAllEffect = useEffectEvent(async () => {
-    await refreshAll();
+    await actions.refreshAll();
   });
 
   const loadJobsEffect = useEffectEvent(async () => {
-    await loadJobs();
+    await actions.loadJobs();
+  });
+
+  const loadWorkflowStateEffect = useEffectEvent(async (reviewFile: string) => {
+    try {
+      await actions.loadWorkflowState(reviewFile);
+      setConnectionError(null);
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? error.message : "Failed to load workflow state.",
+      );
+    }
+  });
+
+  const loadRunDetailEffect = useEffectEvent(async (experimentName: string) => {
+    await actions.loadRunDetail(experimentName);
+  });
+
+  const loadComparisonEffect = useEffectEvent(async (left: string, right: string) => {
+    await actions.loadComparison(left, right);
   });
 
   useEffect(() => {
@@ -577,20 +231,21 @@ export function useLocalAgentController(): LocalAgentContextValue {
     if (!selectedExperiment) {
       return;
     }
-    void loadRunDetail(selectedExperiment);
+    void loadRunDetailEffect(selectedExperiment);
   }, [selectedExperiment]);
 
   useEffect(() => {
-    if (!selectedExperiment || !compareExperiment) {
-      setComparison(null);
-      return;
-    }
-    void loadComparison(selectedExperiment, compareExperiment);
+    const timeoutId = window.setTimeout(() => {
+      void loadWorkflowStateEffect(pipelineForm.review_file);
+    }, 250);
+    return () => window.clearTimeout(timeoutId);
+  }, [pipelineForm.review_file]);
+
+  useEffect(() => {
+    void loadComparisonEffect(selectedExperiment, compareExperiment);
   }, [compareExperiment, selectedExperiment]);
 
   useEffect(() => {
-    setActiveLogs((current) => (current && current.job_id === activeJobId ? current : null));
-
     const socket = new WebSocket(buildJobsWebSocketUrl(activeJobId, LIVE_LOG_TAIL_LINES));
 
     socket.onopen = () => {
@@ -633,6 +288,9 @@ export function useLocalAgentController(): LocalAgentContextValue {
     return () => window.clearInterval(interval);
   }, [streamConnected, activeJobId, jobs, selectedExperiment, compareExperiment]);
 
+  const visibleActiveLogs =
+    activeLogs && activeLogs.job_id === activeJobId ? activeLogs : null;
+
   return {
     runs,
     jobs,
@@ -641,8 +299,9 @@ export function useLocalAgentController(): LocalAgentContextValue {
     compareExperiment,
     runDetail,
     comparison,
+    workflowState,
     activeJobId,
-    activeLogs,
+    activeLogs: visibleActiveLogs,
     clusterReview,
     clusterReviewError,
     isClusterReviewLoading,
@@ -654,18 +313,18 @@ export function useLocalAgentController(): LocalAgentContextValue {
     isSubmitting,
     trainingForm,
     pipelineForm,
-    setSelectedExperiment,
+    setSelectedExperiment: actions.setSelectedExperiment,
     setCompareExperiment: setCompareExperimentState,
     setActiveJobId,
-    setTrainingField,
-    setPipelineField,
-    applyPreset,
-    refreshAll,
-    ensureRunLoaded,
-    reloadClusterReview,
-    saveClusterReview,
-    submitPipeline,
-    submitTraining,
-    cancelActiveJob,
+    setTrainingField: actions.setTrainingField,
+    setPipelineField: actions.setPipelineField,
+    applyPreset: actions.applyPreset,
+    refreshAll: actions.refreshAll,
+    ensureRunLoaded: actions.ensureRunLoaded,
+    reloadClusterReview: actions.reloadClusterReview,
+    saveClusterReview: actions.saveClusterReview,
+    submitPipeline: actions.submitPipeline,
+    submitTraining: actions.submitTraining,
+    cancelActiveJob: actions.cancelActiveJob,
   };
 }

@@ -6,12 +6,19 @@ use serde_json::Value;
 use super::{
     BenchmarkJobRequest, JobManager, PipelineCommand, PipelineJobRequest, TrainingJobRequest,
 };
+use crate::load_review_state_from_paths;
+
+const STEP1_REQUIRED_MESSAGE: &str =
+    "Complete Step 1 first. Run `run-all` so the dataset manifest and summary exist.";
+const STEP2_REQUIRED_MESSAGE: &str = "Complete Step 2 first. Review clusters, save the review, and run `promote-cluster-labels` before using Step 3.";
 
 impl JobManager {
     pub async fn spawn_pipeline_job(
         &self,
         request: PipelineJobRequest,
     ) -> Result<super::JobRecord> {
+        let command_name = request.command.as_cli().to_string();
+        self.validate_pipeline_request(&request, &command_name)?;
         let (_command_name, args) = self.pipeline_args(&request)?;
 
         self.spawn_job(
@@ -122,6 +129,85 @@ impl JobManager {
         Ok((command_name, args))
     }
 
+    pub(super) fn validate_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+        command_name: &str,
+    ) -> Result<()> {
+        if !matches!(
+            request.command,
+            PipelineCommand::Embed
+                | PipelineCommand::Cluster
+                | PipelineCommand::ExportClusterReview
+                | PipelineCommand::PromoteClusterLabels
+        ) {
+            return Ok(());
+        }
+
+        let manifest_path = self.dataset_manifest_path_for_pipeline_request(request);
+        let summary_path = self.dataset_summary_path_for_pipeline_request(request);
+        if !manifest_path.is_file() || !summary_path.is_file() {
+            anyhow::bail!(
+                "Discovery command `{command_name}` requires Step 1 to be complete. {STEP1_REQUIRED_MESSAGE} Expected manifest at `{}` and summary at `{}`.",
+                manifest_path.display(),
+                summary_path.display()
+            );
+        }
+
+        let summary = self
+            .read_pipeline_dataset_summary(request)?
+            .with_context(|| format!("dataset summary missing at {}", summary_path.display()))?;
+
+        if matches!(request.command, PipelineCommand::Cluster) {
+            let embeddings_path = self.embeddings_path_for_pipeline_request(request);
+            let embedding_exists = summary
+                .get("embedding_artifact_exists")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| embeddings_path.is_file());
+            if !embedding_exists {
+                anyhow::bail!(
+                    "Discovery command `{command_name}` requires `embed` first so image similarity vectors exist. Expected embeddings at `{}`.",
+                    embeddings_path.display()
+                );
+            }
+        }
+
+        if matches!(
+            request.command,
+            PipelineCommand::ExportClusterReview | PipelineCommand::PromoteClusterLabels
+        ) {
+            let cluster_summary_path = self.cluster_summary_path_for_pipeline_request(request);
+            let cluster_ready = summary
+                .get("cluster_summary_exists")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| cluster_summary_path.is_file())
+                || summary
+                    .get("clustered_files")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0;
+            if !cluster_ready {
+                anyhow::bail!(
+                    "Discovery command `{command_name}` requires `cluster` first so cluster assignments exist in the manifest."
+                );
+            }
+        }
+
+        if matches!(request.command, PipelineCommand::PromoteClusterLabels) {
+            let review_path = self.review_path_for_pipeline_request(request);
+            let manifest_csv_path = self.dataset_manifest_csv_path_for_pipeline_request(request);
+            let state = load_review_state_from_paths(&manifest_csv_path, &review_path)?;
+            if state.reviewed_count == 0 {
+                anyhow::bail!(
+                    "Discovery command `promote-cluster-labels` requires at least one saved cluster decision in `{}`. Review clusters, save the review, then retry.",
+                    review_path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) fn training_args(
         &self,
         request: &TrainingJobRequest,
@@ -224,6 +310,8 @@ impl JobManager {
         command_name: &str,
         compare_to: Option<&str>,
     ) -> Result<()> {
+        self.validate_training_step_unlocked(request)?;
+
         let training_backend = request
             .training_backend
             .as_deref()
@@ -289,6 +377,35 @@ impl JobManager {
             anyhow::bail!("compare_to is only valid for benchmark jobs");
         }
 
+        Ok(())
+    }
+
+    pub(super) fn validate_training_step_unlocked(
+        &self,
+        request: &TrainingJobRequest,
+    ) -> Result<()> {
+        let summary_path = self.dataset_summary_path_for_training_request(request);
+        if !summary_path.is_file() {
+            anyhow::bail!("{STEP2_REQUIRED_MESSAGE}");
+        }
+
+        let payload = std::fs::read_to_string(&summary_path).with_context(|| {
+            format!("failed to read dataset summary: {}", summary_path.display())
+        })?;
+        let summary: Value = serde_json::from_str(&payload).with_context(|| {
+            format!(
+                "failed to parse dataset summary JSON: {}",
+                summary_path.display()
+            )
+        })?;
+        let accepted_cluster_review_labels = summary
+            .get("accepted_label_source_counts")
+            .and_then(|value| value.get("cluster_review"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if accepted_cluster_review_labels == 0 {
+            anyhow::bail!("{STEP2_REQUIRED_MESSAGE}");
+        }
         Ok(())
     }
 
@@ -359,6 +476,112 @@ impl JobManager {
 
     pub(super) fn dataset_summary_path(&self) -> PathBuf {
         self.artifact_reports_dir().join("summary.json")
+    }
+
+    pub(super) fn pipeline_manifest_dir(&self, request: &PipelineJobRequest) -> PathBuf {
+        request
+            .manifest_dir
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| self.resolve_project_path(value))
+            .unwrap_or_else(|| self.artifact_root().join("manifests"))
+    }
+
+    pub(super) fn pipeline_report_dir(&self, request: &PipelineJobRequest) -> PathBuf {
+        request
+            .report_dir
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| self.resolve_project_path(value))
+            .unwrap_or_else(|| self.artifact_root().join("reports"))
+    }
+
+    pub(super) fn dataset_manifest_path_for_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> PathBuf {
+        self.pipeline_manifest_dir(request)
+            .join("dataset_manifest.parquet")
+    }
+
+    pub(super) fn dataset_manifest_csv_path_for_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> PathBuf {
+        self.pipeline_manifest_dir(request)
+            .join("dataset_manifest.csv")
+    }
+
+    pub(super) fn embeddings_path_for_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> PathBuf {
+        self.pipeline_manifest_dir(request)
+            .join("dataset_embeddings.npz")
+    }
+
+    pub(super) fn cluster_summary_path_for_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> PathBuf {
+        self.pipeline_report_dir(request)
+            .join("cluster_summary.json")
+    }
+
+    pub(super) fn dataset_summary_path_for_pipeline_request(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> PathBuf {
+        self.pipeline_report_dir(request).join("summary.json")
+    }
+
+    pub(super) fn review_path_for_pipeline_request(&self, request: &PipelineJobRequest) -> PathBuf {
+        request
+            .review_file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| self.resolve_project_path(value))
+            .unwrap_or_else(|| {
+                self.pipeline_manifest_dir(request)
+                    .join("cluster_review.csv")
+            })
+    }
+
+    pub(super) fn read_pipeline_dataset_summary(
+        &self,
+        request: &PipelineJobRequest,
+    ) -> Result<Option<Value>> {
+        let summary_path = self.dataset_summary_path_for_pipeline_request(request);
+        if !summary_path.is_file() {
+            return Ok(None);
+        }
+        let payload = std::fs::read_to_string(&summary_path).with_context(|| {
+            format!("failed to read dataset summary: {}", summary_path.display())
+        })?;
+        let summary: Value = serde_json::from_str(&payload).with_context(|| {
+            format!(
+                "failed to parse dataset summary JSON: {}",
+                summary_path.display()
+            )
+        })?;
+        Ok(Some(summary))
+    }
+
+    pub(super) fn dataset_summary_path_for_training_request(
+        &self,
+        request: &TrainingJobRequest,
+    ) -> PathBuf {
+        if let Some(manifest) = request
+            .manifest
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let manifest_path = self.resolve_project_path(manifest);
+            if let Some(artifact_root) = manifest_path.parent().and_then(|path| path.parent()) {
+                return artifact_root.join("reports").join("summary.json");
+            }
+        }
+        self.dataset_summary_path()
     }
 
     pub(super) fn manifest_path_for_request(&self, request: &TrainingJobRequest) -> PathBuf {

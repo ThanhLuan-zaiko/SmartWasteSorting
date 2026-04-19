@@ -124,19 +124,7 @@ impl ClusterReviewStore {
         review_file: Option<&str>,
     ) -> Result<ClusterReviewState, ClusterReviewError> {
         let review_path = self.resolve_review_path(review_file);
-        let mut clusters = self.load_current_clusters()?;
-        let stale_reset_count = self.merge_saved_rows(&review_path, &mut clusters)?;
-        let reviewed_count = clusters
-            .iter()
-            .filter(|cluster| cluster.status != "unlabeled")
-            .count();
-        Ok(ClusterReviewState {
-            review_file: review_path.display().to_string(),
-            cluster_count: clusters.len(),
-            reviewed_count,
-            stale_reset_count,
-            clusters,
-        })
+        load_review_state_from_paths(&self.manifest_csv_path(), &review_path)
     }
 
     pub fn save_review(
@@ -233,11 +221,11 @@ impl ClusterReviewStore {
     }
 
     fn resolve_review_path(&self, review_file: Option<&str>) -> PathBuf {
-        let Some(trimmed) = review_file
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return self.artifact_root().join("manifests").join("cluster_review.csv");
+        let Some(trimmed) = review_file.map(str::trim).filter(|value| !value.is_empty()) else {
+            return self
+                .artifact_root()
+                .join("manifests")
+                .join("cluster_review.csv");
         };
         let path = PathBuf::from(trimmed);
         if path.is_absolute() {
@@ -249,114 +237,6 @@ impl ClusterReviewStore {
 
     fn project_root(&self) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    }
-
-    fn load_current_clusters(&self) -> Result<Vec<ClusterReviewCluster>, ClusterReviewError> {
-        let manifest_path = self.manifest_csv_path();
-        if !manifest_path.is_file() {
-            return Err(ClusterReviewError::InvalidRequest(format!(
-                "Cluster review requires a dataset manifest at `{}`. Run `run-all` first.",
-                manifest_path.display()
-            )));
-        }
-
-        let rows = read_csv_rows(&manifest_path)?;
-        let mut grouped = BTreeMap::<i64, Vec<ManifestClusterRow>>::new();
-        for row in rows {
-            let Some(cluster_id) = parse_optional_i64(row.field("cluster_id"), "cluster_id")? else {
-                continue;
-            };
-            grouped.entry(cluster_id).or_default().push(ManifestClusterRow {
-                sample_id: row.field("sample_id").to_string(),
-                relative_path: row.field("relative_path").to_string(),
-                label: row.field("label").to_string(),
-                label_source: row.field("label_source").to_string(),
-                annotation_status: row.field("annotation_status").to_string(),
-                review_status: row.field("review_status").to_string(),
-                cluster_distance: parse_optional_f64(
-                    row.field("cluster_distance"),
-                    "cluster_distance",
-                )?,
-                is_cluster_outlier: parse_bool(row.field("is_cluster_outlier")),
-            });
-        }
-
-        if grouped.is_empty() {
-            return Err(ClusterReviewError::InvalidRequest(
-                "No cluster assignments are available. Run `cluster` first.".to_string(),
-            ));
-        }
-
-        let mut clusters = grouped
-            .into_iter()
-            .map(|(cluster_id, mut members)| {
-                members.sort_by(|left, right| {
-                    left.cluster_distance
-                        .unwrap_or(f64::INFINITY)
-                        .total_cmp(&right.cluster_distance.unwrap_or(f64::INFINITY))
-                        .then_with(|| left.relative_path.cmp(&right.relative_path))
-                });
-                build_cluster_state(cluster_id, &members)
-            })
-            .collect::<Vec<_>>();
-        clusters.sort_by(|left, right| {
-            right
-                .cluster_size
-                .cmp(&left.cluster_size)
-                .then(left.cluster_id.cmp(&right.cluster_id))
-        });
-        Ok(clusters)
-    }
-
-    fn merge_saved_rows(
-        &self,
-        review_path: &Path,
-        clusters: &mut [ClusterReviewCluster],
-    ) -> Result<usize, ClusterReviewError> {
-        if !review_path.is_file() {
-            return Ok(0);
-        }
-        let saved_rows = read_csv_rows(review_path)?
-            .into_iter()
-            .filter_map(|row| match parse_optional_i64(row.field("cluster_id"), "cluster_id") {
-                Ok(Some(cluster_id)) => Some(Ok((cluster_id, row))),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-
-        let mut stale_reset_count = 0;
-        for cluster in clusters {
-            let Some(row) = saved_rows.get(&cluster.cluster_id) else {
-                continue;
-            };
-            let label = row.field("label");
-            let status = normalize_status(row.field("status"), label)?;
-            let normalized_label = normalize_label(label);
-            if !fingerprints_match(
-                cluster,
-                parse_usize(row.field("cluster_size"), "cluster_size")?,
-                parse_usize(row.field("outlier_count"), "outlier_count")?,
-                row.field("representative_sample_ids"),
-            ) {
-                stale_reset_count += 1;
-                continue;
-            }
-            if status == "labeled" && normalized_label.is_empty() {
-                return Err(ClusterReviewError::InvalidRequest(format!(
-                    "Cluster review row for cluster {} is labeled but has no usable label.",
-                    cluster.cluster_id
-                )));
-            }
-            cluster.status = status.to_string();
-            cluster.label = if status == "labeled" {
-                normalized_label
-            } else {
-                String::new()
-            };
-            cluster.notes = row.field("notes").trim().to_string();
-        }
-        Ok(stale_reset_count)
     }
 
     fn write_review_rows(
@@ -409,6 +289,25 @@ impl ClusterReviewStore {
             ))
         })
     }
+}
+
+pub fn load_review_state_from_paths(
+    manifest_path: &Path,
+    review_path: &Path,
+) -> Result<ClusterReviewState, ClusterReviewError> {
+    let mut clusters = load_current_clusters_from_manifest(manifest_path)?;
+    let stale_reset_count = merge_saved_rows(review_path, &mut clusters)?;
+    let reviewed_count = clusters
+        .iter()
+        .filter(|cluster| cluster.status != "unlabeled")
+        .count();
+    Ok(ClusterReviewState {
+        review_file: review_path.display().to_string(),
+        cluster_count: clusters.len(),
+        reviewed_count,
+        stale_reset_count,
+        clusters,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -482,7 +381,10 @@ fn build_cluster_state(cluster_id: i64, members: &[ManifestClusterRow]) -> Clust
     ClusterReviewCluster {
         cluster_id,
         cluster_size: members.len(),
-        outlier_count: members.iter().filter(|member| member.is_cluster_outlier).count(),
+        outlier_count: members
+            .iter()
+            .filter(|member| member.is_cluster_outlier)
+            .count(),
         representative_sample_ids: representatives
             .iter()
             .map(|member| member.sample_id.as_str())
@@ -499,6 +401,119 @@ fn build_cluster_state(cluster_id: i64, members: &[ManifestClusterRow]) -> Clust
         notes: String::new(),
         representatives,
     }
+}
+
+fn load_current_clusters_from_manifest(
+    manifest_path: &Path,
+) -> Result<Vec<ClusterReviewCluster>, ClusterReviewError> {
+    if !manifest_path.is_file() {
+        return Err(ClusterReviewError::InvalidRequest(format!(
+            "Cluster review requires a dataset manifest at `{}`. Run `run-all` first.",
+            manifest_path.display()
+        )));
+    }
+
+    let rows = read_csv_rows(manifest_path)?;
+    let mut grouped = BTreeMap::<i64, Vec<ManifestClusterRow>>::new();
+    for row in rows {
+        let Some(cluster_id) = parse_optional_i64(row.field("cluster_id"), "cluster_id")? else {
+            continue;
+        };
+        grouped
+            .entry(cluster_id)
+            .or_default()
+            .push(ManifestClusterRow {
+                sample_id: row.field("sample_id").to_string(),
+                relative_path: row.field("relative_path").to_string(),
+                label: row.field("label").to_string(),
+                label_source: row.field("label_source").to_string(),
+                annotation_status: row.field("annotation_status").to_string(),
+                review_status: row.field("review_status").to_string(),
+                cluster_distance: parse_optional_f64(
+                    row.field("cluster_distance"),
+                    "cluster_distance",
+                )?,
+                is_cluster_outlier: parse_bool(row.field("is_cluster_outlier")),
+            });
+    }
+
+    if grouped.is_empty() {
+        return Err(ClusterReviewError::InvalidRequest(
+            "No cluster assignments are available. Run `cluster` first.".to_string(),
+        ));
+    }
+
+    let mut clusters = grouped
+        .into_iter()
+        .map(|(cluster_id, mut members)| {
+            members.sort_by(|left, right| {
+                left.cluster_distance
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&right.cluster_distance.unwrap_or(f64::INFINITY))
+                    .then_with(|| left.relative_path.cmp(&right.relative_path))
+            });
+            build_cluster_state(cluster_id, &members)
+        })
+        .collect::<Vec<_>>();
+    clusters.sort_by(|left, right| {
+        right
+            .cluster_size
+            .cmp(&left.cluster_size)
+            .then(left.cluster_id.cmp(&right.cluster_id))
+    });
+    Ok(clusters)
+}
+
+fn merge_saved_rows(
+    review_path: &Path,
+    clusters: &mut [ClusterReviewCluster],
+) -> Result<usize, ClusterReviewError> {
+    if !review_path.is_file() {
+        return Ok(0);
+    }
+    let saved_rows = read_csv_rows(review_path)?
+        .into_iter()
+        .filter_map(
+            |row| match parse_optional_i64(row.field("cluster_id"), "cluster_id") {
+                Ok(Some(cluster_id)) => Some(Ok((cluster_id, row))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    let mut stale_reset_count = 0;
+    for cluster in clusters {
+        let Some(row) = saved_rows.get(&cluster.cluster_id) else {
+            continue;
+        };
+        let label = row.field("label");
+        let status = normalize_status(row.field("status"), label)?;
+        let normalized_label = normalize_label(label);
+        if !fingerprints_match(
+            cluster,
+            parse_usize(row.field("cluster_size"), "cluster_size")?,
+            parse_usize(row.field("outlier_count"), "outlier_count")?,
+            row.field("representative_sample_ids"),
+        ) {
+            stale_reset_count += 1;
+            continue;
+        }
+        if status == "labeled" && normalized_label.is_empty() {
+            return Err(ClusterReviewError::InvalidRequest(format!(
+                "Cluster review row for cluster {} is labeled but has no usable label.",
+                cluster.cluster_id
+            )));
+        }
+        cluster.status = status.to_string();
+        cluster.label = if status == "labeled" {
+            normalized_label
+        } else {
+            String::new()
+        };
+        cluster.notes = row.field("notes").trim().to_string();
+    }
+    Ok(stale_reset_count)
 }
 
 fn fingerprints_match(
@@ -679,8 +694,8 @@ fn escape_csv_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterReviewCluster, ClusterReviewError, ClusterReviewSaveCluster, ClusterReviewSaveRequest,
-        ClusterReviewStore,
+        ClusterReviewCluster, ClusterReviewError, ClusterReviewSaveCluster,
+        ClusterReviewSaveRequest, ClusterReviewStore,
     };
     use crate::RuntimeConfig;
 
@@ -753,14 +768,21 @@ mod tests {
         );
 
         let store = build_store(&root);
-        let state = store.load_review_state(None).expect("failed to load review state");
+        let state = store
+            .load_review_state(None)
+            .expect("failed to load review state");
 
         assert_eq!(state.cluster_count, 2);
         assert_eq!(state.reviewed_count, 1);
         assert_eq!(state.stale_reset_count, 0);
         assert_eq!(cluster_by_id(&state.clusters, 1).label, "metal");
         assert_eq!(cluster_by_id(&state.clusters, 1).status, "labeled");
-        assert_eq!(cluster_by_id(&state.clusters, 2).current_majority_label.as_deref(), Some("glass"));
+        assert_eq!(
+            cluster_by_id(&state.clusters, 2)
+                .current_majority_label
+                .as_deref(),
+            Some("glass")
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -782,7 +804,9 @@ mod tests {
         );
 
         let store = build_store(&root);
-        let state = store.load_review_state(None).expect("failed to load review state");
+        let state = store
+            .load_review_state(None)
+            .expect("failed to load review state");
 
         assert_eq!(state.stale_reset_count, 1);
         assert_eq!(state.reviewed_count, 0);

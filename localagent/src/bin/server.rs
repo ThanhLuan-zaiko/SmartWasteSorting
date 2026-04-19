@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use localagent_rs::{
     init_tracing, to_api_envelope, ArtifactKind, ArtifactStore, BenchmarkJobRequest,
     ClusterReviewError, ClusterReviewSaveRequest, ClusterReviewStore, JobManager, JobStreamEvent,
-    PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier,
+    PipelineJobRequest, RuntimeConfig, TrainingJobRequest, WasteClassifier, WorkflowState,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -402,6 +402,19 @@ async fn dashboard_summary(
         Ok(payload) => {
             HttpResponse::Ok().json(to_api_envelope("dashboard-summary", experiment, payload))
         }
+        Err(error) => HttpResponse::InternalServerError().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[get("/workflow/state")]
+async fn workflow_state(
+    config: web::Data<RuntimeConfig>,
+    query: web::Query<ClusterReviewQuery>,
+) -> impl Responder {
+    match WorkflowState::from_config(config.get_ref().clone(), query.review_file.as_deref()) {
+        Ok(payload) => HttpResponse::Ok().json(payload),
         Err(error) => HttpResponse::InternalServerError().json(json!({
             "error": error.to_string(),
         })),
@@ -812,6 +825,7 @@ async fn main() -> std::io::Result<()> {
             .service(artifacts_benchmark)
             .service(artifacts_experiment_spec)
             .service(dashboard_summary)
+            .service(workflow_state)
             .service(dataset_image)
             .service(cluster_review)
             .service(save_cluster_review)
