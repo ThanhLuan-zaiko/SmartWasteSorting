@@ -56,7 +56,11 @@ export function TrainingStudio() {
   const trainableLabelCounts = asObject(datasetSummary?.trainable_label_counts);
   const datasetReady = workflowState?.steps.dataset?.completed === true;
   const datasetReadyKnown = workflowState !== null;
+  const trainingStepEnabled = workflowState?.steps.training?.enabled === true;
+  const trainingStepKnown = workflowState !== null;
+  const trainingStepReason = workflowState?.steps.training?.reason ?? null;
   const trainingReady = status?.training_ready === true;
+  const rustPreviewSelected = trainingForm.training_backend === "rust_tch";
   const detectedLabels = Object.keys(labelCounts ?? {}).filter((label) => label !== "unknown");
   const trainableLabels = Object.keys(trainableLabelCounts ?? {}).filter(
     (label) => label !== "unknown",
@@ -68,6 +72,11 @@ export function TrainingStudio() {
     typeof datasetSummary?.effective_training_mode === "string"
       ? datasetSummary.effective_training_mode
       : "weak_inferred";
+  const trainingStudioStatus = !trainingStepKnown
+    ? "checking"
+    : trainingStepEnabled
+      ? "unlocked"
+      : "locked";
 
   function actionBlockReason(command: string): string | null {
     if (!workflowState) {
@@ -304,20 +313,44 @@ export function TrainingStudio() {
         ].join(" ")}
       >
         <p>
+          Training studio:{" "}
+          <span className="font-semibold">
+            {trainingStudioStatus}
+          </span>
+          .{" "}
+          {trainingStepKnown
+            ? trainingStepEnabled
+              ? "Discovery labels have already been promoted into the manifest. Individual actions can still be gated by backend choice or missing checkpoints."
+              : (trainingStepReason ?? "Complete Step 2 first.")
+            : "Checking workflow state."}
+        </p>
+        <p className="mt-2">
           Dataset manifest:{" "}
           <span className="font-semibold">
             {datasetReadyKnown ? (datasetReady ? "ready" : "missing") : "checking"}
           </span>
-          . Step 3 stays locked until Step 2 discovery has been completed and promoted into the
-          manifest.
+          . `warm-cache` only prebuilds the Rust image cache; it does not unlock `fit` by itself.
         </p>
         <p className="mt-2">
-          `rust_tch` stays available for preview metadata flows such as `summary`, `export-spec`,
-          and `benchmark`. Actual training and evaluation still run with `pytorch` in this build.
+          `rust_tch` is preview-only in this build. Actual `fit`, `pseudo-label`, `evaluate`, and
+          `export-onnx` still require `pytorch`.
         </p>
         <p className="mt-2">
           Effective training mode: <span className="font-semibold">{effectiveTrainingMode}</span>.
         </p>
+        {rustPreviewSelected ? (
+          <p className="mt-2">
+            Selected backend: <span className="font-semibold">rust_tch</span>. Switch to{" "}
+            <span className="font-semibold">pytorch</span> to enable `fit`, `pseudo-label`,
+            `evaluate`, and `export-onnx`.
+          </p>
+        ) : null}
+        {!trainingReady ? (
+          <p className="mt-2">
+            `pseudo-label`, `evaluate`, and `export-onnx` stay disabled until an initial `fit`
+            writes a checkpoint for this experiment.
+          </p>
+        ) : null}
         {detectedLabels.length > 0 ? (
           <p className="mt-2">
             Detected labels: <span className="font-semibold">{detectedLabels.join(", ")}</span>

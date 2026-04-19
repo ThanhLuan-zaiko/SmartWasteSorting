@@ -59,6 +59,7 @@ dist/
 
 # Rust / Cargo
 target/
+localagent/target-test*/
 
 # Local runtime logs
 *.log

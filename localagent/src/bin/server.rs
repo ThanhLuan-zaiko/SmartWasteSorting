@@ -17,6 +17,13 @@ struct ClassificationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ImageClassificationRequest {
+    image_base64: String,
+    file_name: Option<String>,
+    top_k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ArtifactQuery {
     experiment: Option<String>,
 }
@@ -97,6 +104,23 @@ async fn classify(
 ) -> impl Responder {
     match classifier.classify_batch(&request.sample_ids) {
         Ok(results) => HttpResponse::Ok().json(results),
+        Err(error) => HttpResponse::InternalServerError().json(json!({
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[post("/classify/image")]
+async fn classify_image(
+    classifier: web::Data<WasteClassifier>,
+    request: web::Json<ImageClassificationRequest>,
+) -> impl Responder {
+    match classifier.classify_uploaded_image(
+        &request.image_base64,
+        request.file_name.as_deref(),
+        request.top_k,
+    ) {
+        Ok(result) => HttpResponse::Ok().json(result),
         Err(error) => HttpResponse::InternalServerError().json(json!({
             "error": error.to_string(),
         })),
@@ -806,6 +830,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(job_manager.clone())
             .service(health)
             .service(classify)
+            .service(classify_image)
             .service(list_jobs)
             .service(get_job)
             .service(create_pipeline_job)

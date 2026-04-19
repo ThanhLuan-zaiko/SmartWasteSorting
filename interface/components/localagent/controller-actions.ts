@@ -245,11 +245,17 @@ export function useLocalAgentActions({
   }
 
   async function ensureRunLoaded(experimentName: string) {
-    setSelectedExperimentState(experimentName);
-    setTrainingForm((current) => ({
-      ...current,
-      experiment_name: experimentName,
-    }));
+    setSelectedExperimentState((current) =>
+      current === experimentName ? current : experimentName,
+    );
+    setTrainingForm((current) =>
+      current.experiment_name === experimentName
+        ? current
+        : {
+            ...current,
+            experiment_name: experimentName,
+          },
+    );
     await loadRunDetail(experimentName);
   }
 
@@ -416,11 +422,15 @@ export function useLocalAgentActions({
   }
 
   function setSelectedExperiment(value: string) {
-    setSelectedExperimentState(value);
-    setTrainingForm((current) => ({
-      ...current,
-      experiment_name: value,
-    }));
+    setSelectedExperimentState((current) => (current === value ? current : value));
+    setTrainingForm((current) =>
+      current.experiment_name === value
+        ? current
+        : {
+            ...current,
+            experiment_name: value,
+          },
+    );
   }
 
   function setTrainingField<K extends keyof TrainingFormState>(

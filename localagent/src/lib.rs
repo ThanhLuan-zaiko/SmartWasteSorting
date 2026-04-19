@@ -17,7 +17,7 @@ pub use cluster_review::{
     ClusterReviewStore,
 };
 pub use config::RuntimeConfig;
-pub use domain::{ClassificationResult, Prediction};
+pub use domain::{ClassificationResult, ImageClassificationResult, Prediction};
 pub use error::AgentError;
 pub use inference::WasteClassifier;
 pub use jobs::{

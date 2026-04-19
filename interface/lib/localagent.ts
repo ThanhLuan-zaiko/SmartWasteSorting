@@ -10,6 +10,12 @@ export type JobStatus =
 
 export type JsonObject = Record<string, unknown>;
 
+export type ArtifactEnvelope<T = JsonObject> = {
+  kind: string;
+  experiment_name: string;
+  payload: T;
+};
+
 export type JobRecord = {
   job_id: string;
   job_type: string;
@@ -223,6 +229,19 @@ export type ClusterReviewSaveRequest = {
     status: ClusterReviewStatus;
     notes?: string;
   }>;
+};
+
+export type ClassificationPrediction = {
+  label: string;
+  score: number;
+};
+
+export type ImageClassificationResponse = {
+  file_name: string;
+  predictions: ClassificationPrediction[];
+  backend: string;
+  model_name: string;
+  image_size: number;
 };
 
 export const DATASET_ACTIONS = [

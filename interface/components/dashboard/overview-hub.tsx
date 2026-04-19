@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { HiArrowUpRight, HiBars3BottomLeft, HiChartBarSquare, HiPlayCircle } from "react-icons/hi2";
+import { HiArrowUpRight, HiBars3BottomLeft, HiBeaker, HiChartBarSquare, HiPlayCircle } from "react-icons/hi2";
 
 import { BenchmarkComparisonChart } from "@/components/charts/benchmark-comparison-chart";
 import { TrainingHistoryChart } from "@/components/charts/training-history-chart";
@@ -97,6 +97,18 @@ export function OverviewHub() {
               <HiChartBarSquare />
               Compare
             </Link>
+            <Link
+              href="/classify"
+              className={[
+                "inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition",
+                isDark
+                  ? "bg-zinc-900 text-zinc-200 hover:bg-zinc-800"
+                  : "bg-zinc-100 text-zinc-700 hover:bg-zinc-200",
+              ].join(" ")}
+            >
+              <HiBeaker />
+              Classify
+            </Link>
           </>
         }
       />
@@ -140,7 +152,7 @@ export function OverviewHub() {
         title="Fast navigation"
         description="Jump straight into execution, logs, or experiment detail pages."
       >
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           {[
             {
               href: "/pipelines",
@@ -153,6 +165,12 @@ export function OverviewHub() {
               label: "Job console",
               copy: "Inspect the local queue and live stdout or stderr tails.",
               icon: HiBars3BottomLeft,
+            },
+            {
+              href: "/classify",
+              label: "ONNX classify",
+              copy: "Upload a real photo and run the exported ONNX model from the browser.",
+              icon: HiBeaker,
             },
             {
               href: selectedExperiment

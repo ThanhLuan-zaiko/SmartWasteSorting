@@ -3,13 +3,14 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  HiArrowPath,
-  HiBars3BottomLeft,
-  HiChartBarSquare,
-  HiMoon,
-  HiPlayCircle,
-  HiSparkles,
-  HiSun,
+    HiArrowPath,
+    HiBars3BottomLeft,
+    HiBeaker,
+    HiChartBarSquare,
+    HiMoon,
+    HiPlayCircle,
+    HiSparkles,
+    HiSun,
 } from "react-icons/hi2";
 import { PiFlaskBold } from "react-icons/pi";
 
@@ -19,6 +20,7 @@ import { useThemeMode } from "@/components/theme-provider";
 const NAV_ITEMS = [
   { href: "/", label: "Overview", icon: HiSparkles },
   { href: "/pipelines", label: "Pipelines", icon: HiPlayCircle },
+  { href: "/classify", label: "Classify", icon: HiBeaker },
   { href: "/jobs", label: "Jobs", icon: HiBars3BottomLeft },
   { href: "/runs", label: "Runs", icon: PiFlaskBold },
   { href: "/compare", label: "Compare", icon: HiChartBarSquare },

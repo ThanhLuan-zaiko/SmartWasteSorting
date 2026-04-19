@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useEffectEvent } from "react";
 import { HiArrowPath, HiRocketLaunch } from "react-icons/hi2";
 
 import { TrainingHistoryChart } from "@/components/charts/training-history-chart";
@@ -30,10 +30,13 @@ export function RunDetailView({ experiment }: { experiment: string }) {
   const evaluation = asObject(benchmark?.evaluation ?? runDetail?.evaluation ?? null);
   const modelManifest = asObject(runDetail?.model_manifest);
   const jobHistory = runDetail?.job_history ?? [];
+  const ensureCurrentRunLoaded = useEffectEvent(async () => {
+    await ensureRunLoaded(experiment);
+  });
 
   useEffect(() => {
-    void ensureRunLoaded(experiment);
-  }, [ensureRunLoaded, experiment]);
+    void ensureCurrentRunLoaded();
+  }, [experiment]);
 
   return (
     <div className="grid gap-6">

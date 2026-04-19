@@ -12,3 +12,12 @@ pub struct ClassificationResult {
     pub predictions: Vec<Prediction>,
     pub backend: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageClassificationResult {
+    pub file_name: String,
+    pub predictions: Vec<Prediction>,
+    pub backend: String,
+    pub model_name: String,
+    pub image_size: usize,
+}
