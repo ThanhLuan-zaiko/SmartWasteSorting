@@ -1,9 +1,11 @@
 "use client";
 
+import { useState } from "react";
 import { HiOutlineArrowPath, HiSparkles } from "react-icons/hi2";
 
 import { ClusterReviewBulkActions } from "@/components/dashboard/discovery/cluster-review-bulk-actions";
 import { ClusterReviewCard } from "@/components/dashboard/discovery/cluster-review-card";
+import { ClusterReviewQueue } from "@/components/dashboard/discovery/cluster-review-queue";
 import { EmptyState, StatusBadge } from "@/components/ui/primitives";
 import type {
   ClusterReviewCluster,
@@ -32,6 +34,8 @@ type ClusterReviewSectionProps = {
     notes: string;
     status: ClusterReviewStatus;
   }) => void;
+  onApplyBulkLabelList: (labels: string[]) => void;
+  onApplyMajorityLabels: () => void;
   onLabelChange: (clusterId: number, nextLabel: string) => void;
   onNotesChange: (clusterId: number, nextNotes: string) => void;
   onReload: () => Promise<void>;
@@ -42,6 +46,8 @@ type ClusterReviewSectionProps = {
   onClearSelection: () => void;
   reviewedClusterCount: number;
   saveDisabledReason: string | null;
+  selectedClusterOrder: number[];
+  selectedMajorityLabelCount: number;
   selectedClusterIds: Set<number>;
 };
 
@@ -61,6 +67,8 @@ export function ClusterReviewSection({
   labelClass,
   labeledClusterCount,
   onApplyBulk,
+  onApplyBulkLabelList,
+  onApplyMajorityLabels,
   onLabelChange,
   onNotesChange,
   onClearSelection,
@@ -71,8 +79,61 @@ export function ClusterReviewSection({
   onToggleSelection,
   reviewedClusterCount,
   saveDisabledReason,
+  selectedClusterOrder,
+  selectedMajorityLabelCount,
   selectedClusterIds,
 }: ClusterReviewSectionProps) {
+  const [viewMode, setViewMode] = useState<"grid" | "queue">("grid");
+  const [activeQueueClusterId, setActiveQueueClusterId] = useState<number | null>(null);
+
+  const queueClusters =
+    selectedClusterIds.size > 0
+      ? draftClusters.filter((cluster) => selectedClusterIds.has(cluster.cluster_id))
+      : draftClusters;
+  const pendingQueueCount = queueClusters.filter(
+    (cluster) => cluster.status === "unlabeled",
+  ).length;
+  const resolvedActiveQueueClusterId =
+    activeQueueClusterId !== null &&
+    queueClusters.some((cluster) => cluster.cluster_id === activeQueueClusterId)
+      ? activeQueueClusterId
+      : (queueClusters.find((cluster) => cluster.status === "unlabeled") ?? queueClusters[0])
+          ?.cluster_id ?? null;
+  const activeQueueCluster =
+    queueClusters.find((cluster) => cluster.cluster_id === resolvedActiveQueueClusterId) ?? null;
+  const activeQueueIndex = activeQueueCluster
+    ? queueClusters.findIndex((cluster) => cluster.cluster_id === activeQueueCluster.cluster_id)
+    : -1;
+  const queueScopeLabel =
+    selectedClusterIds.size > 0
+      ? `${selectedClusterIds.size} selected cluster${
+          selectedClusterIds.size === 1 ? "" : "s"
+        }`
+      : `${draftClusters.length} cluster${draftClusters.length === 1 ? "" : "s"}`;
+
+  function moveQueue(offset: number) {
+    if (queueClusters.length === 0) {
+      return;
+    }
+    const currentIndex = activeQueueIndex >= 0 ? activeQueueIndex : 0;
+    const nextIndex = (currentIndex + offset + queueClusters.length) % queueClusters.length;
+    setActiveQueueClusterId(queueClusters[nextIndex].cluster_id);
+  }
+
+  function goToNextPending() {
+    if (queueClusters.length === 0 || pendingQueueCount === 0) {
+      return;
+    }
+    const startIndex = activeQueueIndex >= 0 ? activeQueueIndex + 1 : 0;
+    for (let offset = 0; offset < queueClusters.length; offset += 1) {
+      const nextIndex = (startIndex + offset) % queueClusters.length;
+      if (queueClusters[nextIndex].status === "unlabeled") {
+        setActiveQueueClusterId(queueClusters[nextIndex].cluster_id);
+        return;
+      }
+    }
+  }
+
   return (
     <div className="mt-7">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -98,6 +159,37 @@ export function ClusterReviewSection({
           )}
         </div>
         <div className="flex flex-wrap gap-3">
+          {clusterReview && draftClusters.length > 0 ? (
+            <div
+              className={[
+                "inline-flex rounded-full border p-1",
+                isDark ? "border-zinc-800 bg-zinc-950" : "border-zinc-200 bg-zinc-100",
+              ].join(" ")}
+            >
+              {(["grid", "queue"] as const).map((mode) => {
+                const isActive = viewMode === mode;
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setViewMode(mode)}
+                    className={[
+                      "rounded-full px-4 py-2 text-sm font-semibold transition",
+                      isActive
+                        ? isDark
+                          ? "bg-white text-black"
+                          : "bg-zinc-950 text-white"
+                        : isDark
+                          ? "text-zinc-300 hover:bg-zinc-900"
+                          : "text-zinc-700 hover:bg-white",
+                    ].join(" ")}
+                  >
+                    {mode === "grid" ? "Grid view" : "Queue mode"}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
           <button
             type="button"
             onClick={() => void onReload()}
@@ -154,6 +246,31 @@ export function ClusterReviewSection({
           {invalidLabeledClusters === 1 ? " is" : "s are"} missing a usable label.
         </p>
       ) : null}
+      {selectedClusterIds.size > 0 && !isDirty && reviewedClusterCount === 0 ? (
+        <p className="mt-2 text-xs text-amber-500">
+          {selectedClusterIds.size} cluster{selectedClusterIds.size === 1 ? "" : "s"} selected.
+          Selection only marks targets for the bulk editor. Click{" "}
+          <span className="font-semibold">
+            Apply to {selectedClusterIds.size} cluster
+            {selectedClusterIds.size === 1 ? "" : "s"}
+          </span>{" "}
+          to change their decision, then save the review.
+        </p>
+      ) : null}
+      {clusterReview && draftClusters.length > 0 ? (
+        <p className="mt-2 text-xs text-zinc-500">
+          You do not need to label all {draftClusters.length} clusters here. In practice, label a
+          few representative clusters across at least 2 classes, save the review, promote those
+          labels, then use Step 3 to expand coverage.
+        </p>
+      ) : null}
+      {clusterReview && draftClusters.length > 0 && viewMode === "queue" ? (
+        <p className="mt-2 text-xs text-zinc-500">
+          Queue mode reviews one cluster at a time and uses the current selection as its scope.
+          Clear selection to queue across every cluster, or keep a subset selected to work through
+          only that slice.
+        </p>
+      ) : null}
       {clusterReviewError ? (
         <div
           className={[
@@ -189,30 +306,57 @@ export function ClusterReviewSection({
           isDark={isDark}
           labelClass={labelClass}
           onApply={onApplyBulk}
+          onApplyLabelList={onApplyBulkLabelList}
+          onApplyMajorityLabels={onApplyMajorityLabels}
           onClearSelection={onClearSelection}
           onSelectAll={onSelectAll}
+          selectedClusterOrder={selectedClusterOrder}
+          selectedMajorityLabelCount={selectedMajorityLabelCount}
           selectedCount={selectedClusterIds.size}
           totalCount={draftClusters.length}
         />
       ) : null}
 
       {clusterReview && draftClusters.length > 0 ? (
-        <div className="mt-4 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-          {draftClusters.map((cluster) => (
-            <ClusterReviewCard
-              key={`cluster-${cluster.cluster_id}`}
-              cluster={cluster}
-              fieldClass={fieldClass}
-              isDark={isDark}
-              labelClass={labelClass}
-              onToggleSelection={onToggleSelection}
-              onLabelChange={onLabelChange}
-              onNotesChange={onNotesChange}
-              onStatusChange={onStatusChange}
-              selected={selectedClusterIds.has(cluster.cluster_id)}
-            />
-          ))}
-        </div>
+        viewMode === "queue" && activeQueueCluster ? (
+          <ClusterReviewQueue
+            activeCluster={activeQueueCluster}
+            currentIndex={activeQueueIndex}
+            fieldClass={fieldClass}
+            isDark={isDark}
+            labelClass={labelClass}
+            onGoNext={() => moveQueue(1)}
+            onGoNextPending={goToNextPending}
+            onGoPrevious={() => moveQueue(-1)}
+            onJumpToCluster={setActiveQueueClusterId}
+            onLabelChange={onLabelChange}
+            onNotesChange={onNotesChange}
+            onStatusChange={onStatusChange}
+            onToggleSelection={onToggleSelection}
+            pendingCount={pendingQueueCount}
+            queueClusters={queueClusters}
+            queueScopeLabel={queueScopeLabel}
+            selected={selectedClusterIds.has(activeQueueCluster.cluster_id)}
+            totalCount={queueClusters.length}
+          />
+        ) : (
+          <div className="mt-4 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+            {draftClusters.map((cluster) => (
+              <ClusterReviewCard
+                key={`cluster-${cluster.cluster_id}`}
+                cluster={cluster}
+                fieldClass={fieldClass}
+                isDark={isDark}
+                labelClass={labelClass}
+                onToggleSelection={onToggleSelection}
+                onLabelChange={onLabelChange}
+                onNotesChange={onNotesChange}
+                onStatusChange={onStatusChange}
+                selected={selectedClusterIds.has(cluster.cluster_id)}
+              />
+            ))}
+          </div>
+        )
       ) : null}
 
       {clusterReview && draftClusters.length === 0 && !isClusterReviewLoading ? (

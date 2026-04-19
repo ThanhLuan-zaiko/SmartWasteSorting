@@ -194,6 +194,15 @@ function DiscoveryWorkflowBody({
   const invalidLabeledClusters = draftClusters.filter(
     (cluster) => cluster.status === "labeled" && !cluster.label.trim(),
   ).length;
+  const selectedMajorityLabelCount = draftClusters.filter((cluster) => {
+    if (!selectedClusterIds.has(cluster.cluster_id)) {
+      return false;
+    }
+    return Boolean(cluster.current_majority_label?.trim());
+  }).length;
+  const selectedClustersInOrder = draftClusters.filter((cluster) =>
+    selectedClusterIds.has(cluster.cluster_id),
+  );
 
   function updateCluster(
     clusterId: number,
@@ -275,6 +284,69 @@ function DiscoveryWorkflowBody({
     setIsDirty(true);
   }
 
+  function handleApplySelectedMajorityLabels() {
+    if (selectedClusterIds.size === 0) {
+      return;
+    }
+    let changed = false;
+    setDraftClusters((current) =>
+      current.map((cluster) => {
+        if (!selectedClusterIds.has(cluster.cluster_id)) {
+          return cluster;
+        }
+        const majorityLabel = cluster.current_majority_label?.trim();
+        if (!majorityLabel) {
+          return cluster;
+        }
+        if (cluster.status === "labeled" && cluster.label === majorityLabel) {
+          return cluster;
+        }
+        changed = true;
+        return {
+          ...cluster,
+          label: majorityLabel,
+          status: "labeled",
+        };
+      }),
+    );
+    if (changed) {
+      setIsDirty(true);
+    }
+  }
+
+  function handleApplyBulkLabelList(labels: string[]) {
+    if (labels.length === 0 || labels.length !== selectedClustersInOrder.length) {
+      return;
+    }
+
+    const nextLabelsByClusterId = new Map<number, string>();
+    selectedClustersInOrder.forEach((cluster, index) => {
+      nextLabelsByClusterId.set(cluster.cluster_id, labels[index]);
+    });
+
+    let changed = false;
+    setDraftClusters((current) =>
+      current.map((cluster) => {
+        const nextLabel = nextLabelsByClusterId.get(cluster.cluster_id);
+        if (nextLabel == null) {
+          return cluster;
+        }
+        if (cluster.status === "labeled" && cluster.label === nextLabel) {
+          return cluster;
+        }
+        changed = true;
+        return {
+          ...cluster,
+          label: nextLabel,
+          status: "labeled",
+        };
+      }),
+    );
+    if (changed) {
+      setIsDirty(true);
+    }
+  }
+
   async function handleSaveReview() {
     if (activeDatasetJob || invalidLabeledClusters > 0) {
       return;
@@ -316,6 +388,17 @@ function DiscoveryWorkflowBody({
     }
     if (CLUSTER_REQUIRED_ACTIONS.has(command) && !clusterReady) {
       return "Run `cluster` first so cluster assignments exist in the manifest.";
+    }
+    if (
+      command === "promote-cluster-labels" &&
+      reviewedClusterCount === 0 &&
+      selectedClusterIds.size > 0
+    ) {
+      return `Selecting ${selectedClusterIds.size} cluster${
+        selectedClusterIds.size === 1 ? "" : "s"
+      } is not enough. Click "Apply to ${selectedClusterIds.size} cluster${
+        selectedClusterIds.size === 1 ? "" : "s"
+      }", then "Save review", then promote labels into the manifest.`;
     }
     if (command === "promote-cluster-labels" && reviewedClusterCount === 0) {
       return "Review at least one cluster below first: set Decision to labeled or excluded, click Save review, then promote labels into the manifest.";
@@ -359,6 +442,8 @@ function DiscoveryWorkflowBody({
         labelClass={labelClass}
         labeledClusterCount={labeledClusterCount}
         onApplyBulk={handleApplyBulkReview}
+        onApplyBulkLabelList={handleApplyBulkLabelList}
+        onApplyMajorityLabels={handleApplySelectedMajorityLabels}
         onLabelChange={handleLabelChange}
         onNotesChange={handleNotesChange}
         onClearSelection={clearClusterSelection}
@@ -369,6 +454,8 @@ function DiscoveryWorkflowBody({
         onToggleSelection={toggleClusterSelection}
         reviewedClusterCount={reviewedClusterCount}
         saveDisabledReason={saveDisabledReason}
+        selectedClusterOrder={selectedClustersInOrder.map((cluster) => cluster.cluster_id)}
+        selectedMajorityLabelCount={selectedMajorityLabelCount}
         selectedClusterIds={selectedClusterIds}
       />
     </>

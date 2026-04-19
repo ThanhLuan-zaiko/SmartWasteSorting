@@ -14,8 +14,12 @@ type ClusterReviewBulkActionsProps = {
     notes: string;
     status: ClusterReviewStatus;
   }) => void;
+  onApplyLabelList: (labels: string[]) => void;
+  onApplyMajorityLabels: () => void;
   onClearSelection: () => void;
   onSelectAll: () => void;
+  selectedClusterOrder: number[];
+  selectedMajorityLabelCount: number;
   selectedCount: number;
   totalCount: number;
 };
@@ -25,17 +29,28 @@ export function ClusterReviewBulkActions({
   isDark,
   labelClass,
   onApply,
+  onApplyLabelList,
+  onApplyMajorityLabels,
   onClearSelection,
   onSelectAll,
+  selectedClusterOrder,
+  selectedMajorityLabelCount,
   selectedCount,
   totalCount,
 }: ClusterReviewBulkActionsProps) {
   const [bulkLabel, setBulkLabel] = useState("");
   const [bulkStatus, setBulkStatus] = useState<ClusterReviewStatus>("labeled");
   const [bulkNotes, setBulkNotes] = useState("");
+  const [bulkLabelList, setBulkLabelList] = useState("");
 
   const applyDisabled =
     selectedCount === 0 || (bulkStatus === "labeled" && !bulkLabel.trim());
+  const parsedLabelList = bulkLabelList
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  const applyLabelListDisabled =
+    selectedCount === 0 || parsedLabelList.length !== selectedClusterOrder.length;
 
   function handleApply() {
     if (applyDisabled) {
@@ -46,6 +61,13 @@ export function ClusterReviewBulkActions({
       notes: bulkNotes,
       status: bulkStatus,
     });
+  }
+
+  function handleApplyLabelList() {
+    if (applyLabelListDisabled) {
+      return;
+    }
+    onApplyLabelList(parsedLabelList);
   }
 
   return (
@@ -69,18 +91,38 @@ export function ClusterReviewBulkActions({
             <div>
               <p className="text-sm font-semibold">Bulk cluster actions</p>
               <p className="text-sm text-zinc-500">
-                Select clusters, assign one label/decision in bulk, then save and promote.
+                Select clusters, apply one label or decision in bulk, then save and promote.
               </p>
             </div>
           </div>
           <p className="mt-3 text-xs text-zinc-500">
-            To use <span className="font-semibold">promote-cluster-labels</span>, bulk-assign a
-            label with <span className="font-semibold">Decision = labeled</span>, click{" "}
+            To use <span className="font-semibold">promote-cluster-labels</span>:{" "}
+            <span className="font-semibold">Select</span> clusters, click{" "}
+            <span className="font-semibold">Apply to N clusters</span>, then{" "}
             <span className="font-semibold">Save review</span>, then promote the saved review
             into the manifest.
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={onApplyMajorityLabels}
+            disabled={selectedMajorityLabelCount === 0}
+            title={
+              selectedCount === 0
+                ? "Select clusters first."
+                : selectedMajorityLabelCount === 0
+                  ? "No majority label is available for the current selection."
+                  : undefined
+            }
+            className={[
+              "inline-flex items-center gap-2 rounded-full px-4 py-3 text-sm font-semibold transition",
+              isDark ? "bg-zinc-900 text-zinc-200 hover:bg-zinc-800" : "bg-white text-zinc-800 hover:bg-zinc-100",
+              selectedMajorityLabelCount === 0 ? "opacity-60" : "",
+            ].join(" ")}
+          >
+            Use majority labels ({selectedMajorityLabelCount})
+          </button>
           <button
             type="button"
             onClick={onSelectAll}
@@ -156,12 +198,56 @@ export function ClusterReviewBulkActions({
         </div>
       </div>
 
+      <div className="mt-4 rounded-[1.1rem] border border-dashed px-4 py-4">
+        <div className="flex flex-col gap-2">
+          <span className={labelClass}>Label List For Selected Clusters</span>
+          <textarea
+            className={[fieldClass, "min-h-32 resize-y"].join(" ")}
+            value={bulkLabelList}
+            placeholder={`paper\nfork\nglass`}
+            onChange={(event) => setBulkLabelList(event.target.value)}
+          />
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <p className="text-xs text-zinc-500">
+              Paste one label per line. Line 1 maps to Cluster{" "}
+              {selectedClusterOrder[0] ?? "?"}, line 2 to Cluster{" "}
+              {selectedClusterOrder[1] ?? "?"}, and so on in the current on-screen order.
+            </p>
+            <button
+              type="button"
+              onClick={handleApplyLabelList}
+              disabled={applyLabelListDisabled}
+              title={
+                selectedCount === 0
+                  ? "Select clusters first."
+                  : parsedLabelList.length !== selectedClusterOrder.length
+                    ? `Provide exactly ${selectedClusterOrder.length} non-empty label lines.`
+                    : undefined
+              }
+              className={[
+                "inline-flex items-center justify-center rounded-full px-4 py-3 text-sm font-semibold transition",
+                isDark ? "bg-white text-black hover:bg-zinc-200" : "bg-zinc-950 text-white hover:bg-zinc-800",
+                applyLabelListDisabled ? "opacity-60" : "",
+              ].join(" ")}
+            >
+              Apply label list
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div className="mt-3 text-xs text-zinc-500">
         {selectedCount === 0
           ? "Select at least one cluster card below before applying a bulk label or decision."
+          : selectedMajorityLabelCount > 0
+            ? `Use "Use majority labels (${selectedMajorityLabelCount})" to auto-fill clusters that already have a manifest majority label, or apply one shared bulk label below.`
+            : parsedLabelList.length > 0 && parsedLabelList.length !== selectedClusterOrder.length
+              ? `The label list needs exactly ${selectedClusterOrder.length} non-empty lines for the current selection.`
           : bulkStatus === "labeled" && !bulkLabel.trim()
             ? "Enter a label before applying the labeled decision to selected clusters."
-            : `Ready to update ${selectedCount} selected cluster${selectedCount === 1 ? "" : "s"}.`}
+            : `Selection alone does not unlock promote. Click "Apply to ${selectedCount} cluster${
+                selectedCount === 1 ? "" : "s"
+              }" to copy this bulk decision into the selected cards.`}
       </div>
     </div>
   );
